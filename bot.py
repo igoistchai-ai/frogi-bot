@@ -10,7 +10,7 @@ RENDER (Web Service, Language=Python):
     Environment:    BOT_TOKEN=123456:your_telegram_bot_token
     Optional:       ADMIN_IDS=123456789,987654321
                     ADMIN_TOKEN=<long_random_secret>
-                    DATABASE_PATH=/var/data/frogi.sqlite (paid persistent disk only)
+                    DATABASE_PATH=/var/data/frogi.sqlite (ONLY if paid disk is mounted)
                     PUBLIC_URL=https://your-custom-domain.example (otherwise Render auto detects)
     Render injects PORT and RENDER_EXTERNAL_URL automatically. One process only.
 
@@ -47,6 +47,7 @@ import secrets
 import signal
 import sqlite3
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -64,7 +65,9 @@ PORT = int(os.getenv('PORT', '10000'))
 PUBLIC_URL = (os.getenv('PUBLIC_URL') or os.getenv('WEBAPP_URL') or os.getenv('RENDER_EXTERNAL_URL') or '').strip().rstrip('/')
 if PUBLIC_URL and (not PUBLIC_URL.startswith('https://') or urlsplit(PUBLIC_URL).username or urlsplit(PUBLIC_URL).password or urlsplit(PUBLIC_URL).query or urlsplit(PUBLIC_URL).fragment):
     raise RuntimeError('PUBLIC_URL must be a clean https://... URL')
-DB_PATH = os.getenv('DATABASE_PATH') or os.getenv('DB_PATH') or 'frogi.sqlite3'
+DB_PATH = (os.getenv('DATABASE_PATH') or os.getenv('DB_PATH') or 'frogi.sqlite3').strip()
+DATABASE_TEMPORARY = False
+DATABASE_FALLBACK_REASON = ''
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', os.getenv('TELEGRAM_ADMIN_IDS', '')).split(',') if x.strip().isdigit()}
 ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', '')
 DEMO_AUTH = os.getenv('ALLOW_DEMO_AUTH', '').lower() == 'true' and not PUBLIC_URL
@@ -151,8 +154,61 @@ def count(c, sql, params=()):
     return c.execute(sql, params).fetchone()[0]
 
 
+def _check_database_path(location):
+    """Check the directory and file are actually writable before SQLite startup.
+
+    A writable parent directory isn't enough when an existing database file is
+    read-only. Checking first gives a useful log instead of a raw traceback.
+    """
+    path = Path(location).expanduser()
+    if path.is_dir():
+        raise IsADirectoryError(f'Database path is a directory: {path}')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A real create/unlink catches Render's unmounted /var/data and read-only FS.
+    with tempfile.NamedTemporaryFile(prefix='.frogi_probe_', suffix='.tmp',
+                                     dir=str(path.parent)):
+        pass
+    if path.exists():
+        with path.open('rb+'):
+            pass
+    return str(path)
+
+
+def prepare_database_path():
+    """Do not crash when an unmounted Render persistent disk was configured.
+
+    A missing/readonly paid disk is NOT equivalent to durable storage: warn
+    prominently and use a writable *temporary* SQLite file to keep the demo
+    available. Persistent users should attach a disk, not rely on fallback.
+    """
+    global DB_PATH, DATABASE_TEMPORARY, DATABASE_FALLBACK_REASON
+    chosen = DB_PATH
+    try:
+        DB_PATH = _check_database_path(chosen)
+        # Even a writable path is temporary on Render Free without a disk.
+        DATABASE_TEMPORARY = os.environ.get('RENDER', '').lower() == 'true' and not os.path.realpath(DB_PATH).startswith('/var/data/')
+        DATABASE_FALLBACK_REASON = ''
+        return
+    except (OSError, ValueError) as exc:
+        reason = f'{type(exc).__name__}: {exc}'
+        if os.getenv('REQUIRE_DATABASE_PATH', '').lower() in ('true', '1', 'yes'):
+            raise RuntimeError(f'Persistent database unavailable at {chosen}: {reason}') from exc
+        # Linux /tmp is writable on Render Free. Keep a predictable location
+        # within this instance, so concurrent threads always see one database.
+        fallback = Path(tempfile.gettempdir()) / 'frogi-arena' / 'frogi.sqlite3'
+        try:
+            DB_PATH = _check_database_path(fallback)
+        except OSError as fallback_exc:
+            raise RuntimeError(f'Cannot open configured DB ({chosen}) or fallback ({fallback})') from fallback_exc
+        DATABASE_TEMPORARY = True
+        DATABASE_FALLBACK_REASON = reason
+        LOG.error('DATABASE_PATH=%r cannot be used: %s', chosen, reason)
+        LOG.error('FROGI switched to TEMPORARY SQLite: %s. Render Free data WILL be lost after restart! '
+                  'Remove DATABASE_PATH from Render Environment; for permanent data attach a disk at /var/data.', DB_PATH)
+
+
 def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    prepare_database_path()
     # sqlite3.executescript() commits implicitly, so run the schema DDL first
     # under the global lock; seed/maintenance use an explicit transaction below.
     with LOCK:
@@ -876,24 +932,43 @@ def setup_telegram():
     if not TOKEN:
         LOG.warning('BOT_TOKEN not configured. Public Telegram auth and bot are disabled.')
         return
+    # Register the webhook FIRST: optional menu commands must not block the bot.
+    # Transient network outages may occur when Render wakes from sleep.
+    for attempt in range(1, 6):
+        try:
+            me = tg_api('getMe') or {}
+            BOT_USERNAME = me.get('username', '')
+            if PUBLIC_URL:
+                tg_api('setWebhook', {'url': PUBLIC_URL + WEBHOOK_PATH,
+                                      'secret_token': WEBHOOK_SECRET,
+                                      'drop_pending_updates': False,
+                                      'allowed_updates': ['message', 'callback_query'],
+                                      'max_connections': 10})
+                LOG.info('Telegram webhook active at configured HTTPS host; bot @%s', BOT_USERNAME)
+            else:
+                tg_api('deleteWebhook', {'drop_pending_updates': False})
+                LOG.info('Starting Telegram long polling (no PUBLIC_URL).')
+                threading.Thread(target=poll_telegram, name='frogi-poll', daemon=True).start()
+            break
+        except Exception as err:
+            # Do not log URLs (which contain BOT_TOKEN) or initData.
+            LOG.error('Telegram webhook setup failed, attempt %s/5: %s', attempt,
+                      str(err).replace(TOKEN, '[TOKEN]')[:250])
+            if attempt == 5:
+                LOG.error('Telegram bot not initialized. Verify BOT_TOKEN, PUBLIC_URL and Render network; redeploy to retry.')
+                return
+            time.sleep(min(2 ** attempt, 15))
+    # These features are optional. The webhook must keep working when one fails.
     try:
-        BOT_USERNAME = (tg_api('getMe') or {}).get('username', '')
-        LOG.info('Telegram bot connected: @%s', BOT_USERNAME)
-        tg_api('setMyCommands', {'commands': [{'command': c, 'description': desc} for c,desc in BOT_COMMANDS]})
-        if PUBLIC_URL:
-            tg_api('setWebhook', {'url': PUBLIC_URL + WEBHOOK_PATH,
-                                  'secret_token': WEBHOOK_SECRET, 'drop_pending_updates': False,
-                                  'allowed_updates': ['message', 'callback_query'], 'max_connections': 10})
+        tg_api('setMyCommands', {'commands': [{'command': c, 'description': desc} for c, desc in BOT_COMMANDS]})
+    except Exception as err:
+        LOG.warning('Telegram setMyCommands unavailable: %s', str(err).replace(TOKEN, '[TOKEN]')[:180])
+    if PUBLIC_URL:
+        try:
             tg_api('setChatMenuButton', {'menu_button': {'type': 'web_app', 'text': 'FROGI Arena',
                                                       'web_app': {'url': PUBLIC_URL}}})
-            LOG.info('Telegram webhook configured on public HTTPS URL (path hidden).')
-        else:
-            tg_api('deleteWebhook', {'drop_pending_updates': False})
-            LOG.info('No PUBLIC_URL; starting Telegram long polling in same Python process.')
-            threading.Thread(target=poll_telegram, name='frogi-poll', daemon=True).start()
-    except Exception as err:
-        LOG.error('Telegram initialization failed: %s', type(err).__name__)
-        # A restart/redeploy retries webhook setup. HTTP service still stays available.
+        except Exception as err:
+            LOG.warning('Telegram setChatMenuButton unavailable: %s', str(err).replace(TOKEN, '[TOKEN]')[:180])
 
 
 def poll_telegram():
@@ -1675,7 +1750,8 @@ class FrogiHandler(BaseHTTPRequestHandler):
             path = url.path
             if self.command == 'GET' and path in ('/health', '/healthz'):
                 return self.reply({'ok': True, 'service': 'FROGI Arena', 'botConfigured': bool(TOKEN),
-                                   'webhookMode': bool(PUBLIC_URL)})
+                                   'webhookMode': bool(PUBLIC_URL),
+                                   'databaseTemporary': DATABASE_TEMPORARY})
             if self.command == 'GET' and path in ('/', '/app'):
                 doc = HTML.encode('utf-8')
                 self.common_headers('text/html; charset=utf-8', len(doc))
@@ -1737,8 +1813,8 @@ def main():
     server = ThreadingHTTPServer(('0.0.0.0', PORT), FrogiHandler)
     server.daemon_threads = True
     LOG.info('FROGI ready: http://0.0.0.0:%d • Mini App + API + Telegram', PORT)
-    if os.getenv('RENDER') == 'true' and not DB_PATH.startswith('/var/data/'):
-        LOG.warning('Render local SQLite database is EPHEMERAL! Set persistent disk and DATABASE_PATH for durable data.')
+    if DATABASE_TEMPORARY:
+        LOG.warning('SQLite storage is TEMPORARY. Account balances cannot be relied on across Render restarts.')
     threading.Thread(target=setup_telegram, name='frogi-telegram-init', daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.3)
@@ -1800,7 +1876,8 @@ External Python dependencies: ZERO.
 
       ADMIN_IDS      = 111111111,222222222
       ADMIN_TOKEN    = a_secret_of_at_least_16_characters
-      DATABASE_PATH  = /var/data/frogi.sqlite3
+      DATABASE_PATH  = /var/data/frogi.sqlite3  (ONLY with a mounted PAID disk)
+      REQUIRE_DATABASE_PATH = true  (optional; abort rather than fall back)
       PUBLIC_URL     = https://custom-domain.example
       PORT           = 10000 (Render supplies this automatically)
       LOG_LEVEL      = INFO
@@ -1841,6 +1918,11 @@ External Python dependencies: ZERO.
     - Move database operations to a managed Postgres database (would require
       changing this one-file implementation and adding a DB driver), or
     - Use a hosted service offering persistent files.
+
+  On Render Free, REMOVE DATABASE_PATH and DB_PATH environment variables.
+  Never use /var/data without attaching a PAID persistent disk. If that path
+  is configured accidentally, bot.py will warn and fall back to temporary
+  SQLite at /tmp/frogi-arena/frogi.sqlite3 instead of crashing.
 
   Paid Render is NOT required to test the bot's interface, but it is needed
   for durable local SQLite there. Free is for testing only.
@@ -1960,6 +2042,7 @@ External Python dependencies: ZERO.
   "BOT_TOKEN is not set": add BOT_TOKEN in Render -> Environment.
   "No app button": wait for webhook setup, redeploy and send /start.
   "Unsupported URL": keep PUBLIC_URL valid HTTPS with no URL query string.
+  "Permission denied: /var/data": remove DATABASE_PATH on Render Free; redeploy.
   "Database is locked": use only one service instance, check disk and writes.
   "Lost balances": local SQLite on Render Free is not persistent.
   "Bot doesn't answer": check Render logs and Telegram token in BotFather.
@@ -2189,6 +2272,71 @@ def selftest():
             self.assertNotIn('BOT_TOKEN=', HTML)
             self.assertNotIn('WEBHOOK_SECRET=', HTML)
             self.assertTrue(WEBHOOK_PATH.startswith('/tg/'))
+
+        def test_27_unavailable_database_path_falls_back(self):
+            global DB_PATH, DATABASE_TEMPORARY, DATABASE_FALLBACK_REASON
+            from unittest.mock import patch
+            previous = DB_PATH
+            try:
+                DB_PATH = '/proc/frogi-unwritable-root/data/frogi.sqlite3'
+                with patch.dict(os.environ, {'REQUIRE_DATABASE_PATH': ''}):
+                    init_db()
+                self.assertTrue(DATABASE_TEMPORARY)
+                self.assertTrue(DB_PATH.endswith('frogi-arena/frogi.sqlite3'))
+                with readonly() as c:
+                    self.assertEqual(count(c, 'SELECT COUNT(*) FROM gifts'), 16)
+            finally:
+                DB_PATH = previous
+                DATABASE_TEMPORARY = False
+                DATABASE_FALLBACK_REASON = ''
+
+        def test_28_valid_explicit_storage_stays_in_place(self):
+            global DB_PATH, DATABASE_TEMPORARY
+            previous = DB_PATH
+            try:
+                DB_PATH = os.path.join(self.temp.name, 'mounted', 'frogi.sqlite3')
+                init_db()
+                self.assertEqual(DB_PATH, os.path.join(self.temp.name, 'mounted', 'frogi.sqlite3'))
+                self.assertFalse(DATABASE_TEMPORARY)
+            finally:
+                DB_PATH = previous
+
+        def test_29_strict_storage_must_fail_explicitly(self):
+            global DB_PATH
+            from unittest.mock import patch
+            previous = DB_PATH
+            try:
+                DB_PATH = '/proc/frogi-unwritable-root/data/frogi.sqlite3'
+                with patch.dict(os.environ, {'REQUIRE_DATABASE_PATH': 'true'}):
+                    with self.assertRaisesRegex(RuntimeError, 'Persistent database unavailable'):
+                        init_db()
+            finally:
+                DB_PATH = previous
+
+        def test_30_same_embedded_ui_preserved(self):
+            self.assertIn('FROGI ARENA', HTML)
+            self.assertIn('wheel-face', HTML)
+            self.assertIn('support-form', HTML)
+            self.assertIn('id="app"', HTML)
+            self.assertGreater(len(HTML), 100000)
+
+        def test_31_telegram_webhook_runs_before_optional_commands(self):
+            global BOT_USERNAME
+            from unittest.mock import patch
+            calls = []
+            def fake_api(method, args=None, timeout=15):
+                calls.append(method)
+                if method == 'getMe':
+                    return {'username': 'frogi_demo_bot'}
+                if method in ('setMyCommands','setChatMenuButton'):
+                    raise RuntimeError('optional Telegram method failed')
+                return True
+            with patch.dict(globals(), {'TOKEN': 'some-token', 'PUBLIC_URL': 'https://example.onrender.com',
+                                        'WEBHOOK_SECRET': 'X' * 32, 'WEBHOOK_PATH': '/tg/example'}):
+                with patch.object(__import__(__name__), 'tg_api', side_effect=fake_api):
+                    setup_telegram()
+            self.assertEqual(calls[:2], ['getMe','setWebhook'])
+            self.assertIn('setChatMenuButton', calls)
 
     def auth_session_for_test(c, uid):
         t=secrets.token_urlsafe(32)
