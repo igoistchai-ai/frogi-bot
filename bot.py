@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FROGI ARENA • ALL IN ONE • Telegram bot + responsive Mini App + HTTP API + SQLite.
+FROGI ARENA 3.0 • ALL IN ONE • Telegram bot + responsive Mini App + HTTP API + SQLite.
 Python 3.10+. No pip packages, Node.js, npm, Vite, React, or other files required.
 
 RENDER (Web Service, Language=Python):
@@ -51,7 +51,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -73,6 +73,9 @@ ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', '')
 DEMO_AUTH = os.getenv('ALLOW_DEMO_AUTH', '').lower() == 'true' and not PUBLIC_URL
 SPIN_COST = 100
 DAY_REWARD = 75
+DAILY_SCHEDULE = (75, 100, 125, 150, 175, 225, 350)
+MISSION_REWARDS = {"spin_1": 60, "spin_5": 125, "collection_3": 80, "collection_10": 180, "market_1": 55, "market_3": 115, "daily_1": 40, "favorites_1": 35}
+ACHIEVEMENT_REWARDS = {m: 40 for m in ("hello_frogi", "first_spin", "spin_5", "spin_20", "collector_1", "collector_5", "collector_15", "rare_finder", "epic_finder", "legend_finder", "market_first", "market_10", "daily_first", "daily_7", "favorites_3", "promotional")}
 PROMOS = {'FROGI2026': 250, 'HELLOFROGI': 100, 'ARENASTART': 150}
 PRIZE_WEIGHTS = [('frog_common', 6500), ('red_crystal', 2500), ('blue_orbit', 850), ('gold_frog', 150)]
 RARITY_POINTS = {'Common': 10, 'Rare': 30, 'Epic': 80, 'Legendary': 200}
@@ -271,6 +274,20 @@ def init_db():
           CREATE TABLE IF NOT EXISTS achievements (
             user_id TEXT NOT NULL REFERENCES users(id), achievement_id TEXT NOT NULL,
             unlocked_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,achievement_id)
+          );
+          CREATE TABLE IF NOT EXISTS mission_rewards (
+            user_id TEXT NOT NULL REFERENCES users(id), mission_id TEXT NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount>0), claimed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id,mission_id)
+          );
+          CREATE TABLE IF NOT EXISTS achievement_rewards (
+            user_id TEXT NOT NULL REFERENCES users(id), achievement_id TEXT NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount>0), claimed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id,achievement_id)
+          );
+          CREATE TABLE IF NOT EXISTS wishlist (
+            user_id TEXT NOT NULL REFERENCES users(id), gift_id TEXT NOT NULL REFERENCES gifts(id),
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,gift_id)
           );
           CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL REFERENCES users(id),
@@ -471,16 +488,81 @@ def buy(c, uid, gid, key=None):
     return result
 
 
+def daily_streak(claims):
+    """Calculate streak from recorded UTC days; no client clock is trusted."""
+    seen = {c['day'] for c in claims}
+    today = datetime.now(timezone.utc).date()
+    reference = today if today.isoformat() in seen else today - timedelta(days=1)
+    count_days = 0
+    while reference.isoformat() in seen:
+        count_days += 1
+        reference -= timedelta(days=1)
+    return count_days
+
+
+def daily_summary(c, uid):
+    claims = rows(c, 'SELECT day,amount FROM daily_claims WHERE user_id=? ORDER BY day DESC LIMIT 60', (uid,))
+    today = utc_day()
+    claimed = any(x['day'] == today for x in claims)
+    streak = daily_streak(claims)
+    # At a completed streak, today's reward corresponds to the last day claimed.
+    reward_index = max(0, streak - 1) if claimed else streak
+    reward_index = reward_index % len(DAILY_SCHEDULE)
+    return {'reward': DAILY_SCHEDULE[reward_index], 'today': today,
+            'claimed': claimed, 'history': claims[:20], 'streak': streak,
+            'dayIndex': reward_index + 1, 'schedule': list(DAILY_SCHEDULE),
+            'nextReward': DAILY_SCHEDULE[streak % len(DAILY_SCHEDULE)],
+            'resetAt': (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()}
+
+
 def daily(c, uid):
+    current = daily_summary(c, uid)
+    if current['claimed']:
+        fail('ALREADY_CLAIMED', 'Бонус сегодня уже получен.', 409)
+    amount = current['reward']
     day = utc_day()
     try:
-        c.execute('INSERT INTO daily_claims(user_id,day,amount) VALUES(?,?,?)', (uid, day, DAY_REWARD))
+        c.execute('INSERT INTO daily_claims(user_id,day,amount) VALUES(?,?,?)', (uid, day, amount))
     except sqlite3.IntegrityError:
         fail('ALREADY_CLAIMED', 'Бонус сегодня уже получен.', 409)
-    add_credit(c, uid, DAY_REWARD, 'daily_reward', {'day': day})
-    notify(c, uid, 'reward', 'Ежедневный бонус', f'+{DAY_REWARD} тестовых FC')
+    add_credit(c, uid, amount, 'daily_reward', {'day': day, 'dayIndex': current['dayIndex']})
+    notify(c, uid, 'reward', 'Ежедневная награда', f'+{amount} тестовых FC · серия дней')
     sync_achievements(c, uid)
-    return {'reward': DAY_REWARD, 'day': day, 'user': user_balance(c, uid)}
+    return {'reward': amount, 'day': day, 'user': user_balance(c, uid), 'daily': daily_summary(c, uid)}
+
+
+def claim_mission(c, uid, mission_id):
+    definition = next((m for m in MISSIONS if m['id'] == mission_id), None)
+    if not definition:
+        fail('NOT_FOUND', 'Задание не найдено.', 404)
+    stats = statistics(c, uid)
+    if stats.get(definition['group'], 0) < definition['target']:
+        fail('NOT_COMPLETE', 'Задание ещё не выполнено.', 409)
+    amount = MISSION_REWARDS.get(mission_id, 40)
+    try:
+        c.execute('INSERT INTO mission_rewards(user_id,mission_id,amount) VALUES(?,?,?)', (uid, mission_id, amount))
+    except sqlite3.IntegrityError:
+        fail('ALREADY_CLAIMED', 'Награда задания уже получена.', 409)
+    add_credit(c, uid, amount, 'mission_reward', {'missionId': mission_id})
+    notify(c, uid, 'reward', 'Награда за задание', f'{definition["title"]}: +{amount} FC')
+    return {'reward': amount, 'missionId': mission_id, 'user': user_balance(c, uid)}
+
+
+def claim_achievement(c, uid, achievement_id):
+    definition = next((a for a in MILESTONES if a['id'] == achievement_id), None)
+    if not definition:
+        fail('NOT_FOUND', 'Достижение не найдено.', 404)
+    stats = statistics(c, uid)
+    if stats.get(definition['category'], 0) < definition['threshold']:
+        fail('LOCKED', 'Достижение ещё закрыто.', 409)
+    amount = ACHIEVEMENT_REWARDS.get(achievement_id, 40)
+    try:
+        c.execute('INSERT INTO achievement_rewards(user_id,achievement_id,amount) VALUES(?,?,?)', (uid, achievement_id, amount))
+    except sqlite3.IntegrityError:
+        fail('ALREADY_CLAIMED', 'Награда достижения уже получена.', 409)
+    add_credit(c, uid, amount, 'achievement_reward', {'achievementId': achievement_id})
+    notify(c, uid, 'achievement', 'Достижение завершено', f'{definition["title"]}: +{amount} FC')
+    return {'reward': amount, 'achievementId': achievement_id, 'user': user_balance(c, uid)}
 
 
 def redeem(c, uid, code):
@@ -535,13 +617,21 @@ def level_data(score):
 
 def progress(c, uid):
     st = statistics(c, uid)
+    claimed_missions = {r['mission_id'] for r in rows(c, 'SELECT mission_id FROM mission_rewards WHERE user_id=?', (uid,))}
+    claimed_achievements = {r['achievement_id'] for r in rows(c, 'SELECT achievement_id FROM achievement_rewards WHERE user_id=?', (uid,))}
     achievements = [{**item, 'current': min(st.get(item['category'], 0), item['threshold']),
-                     'unlocked': st.get(item['category'], 0) >= item['threshold']} for item in MILESTONES]
+                     'unlocked': st.get(item['category'], 0) >= item['threshold'],
+                     'reward': ACHIEVEMENT_REWARDS.get(item['id'], 40),
+                     'claimed': item['id'] in claimed_achievements} for item in MILESTONES]
     missions = [{**item, 'current': min(st.get(item['group'], 0), item['target']),
-                 'completed': st.get(item['group'], 0) >= item['target']} for item in MISSIONS]
+                 'completed': st.get(item['group'], 0) >= item['target'],
+                 'reward': MISSION_REWARDS.get(item['id'], 40),
+                 'claimed': item['id'] in claimed_missions} for item in MISSIONS]
     return {'stats': st, 'level': level_data(st['totalScore']), 'achievements': achievements, 'missions': missions,
             'unlockedCount': sum(x['unlocked'] for x in achievements),
-            'completedMissions': sum(x['completed'] for x in missions)}
+            'completedMissions': sum(x['completed'] for x in missions),
+            'claimable': sum(x['completed'] and not x['claimed'] for x in missions)
+                       + sum(x['unlocked'] and not x['claimed'] for x in achievements)}
 
 
 def sync_achievements(c, uid):
@@ -562,18 +652,19 @@ def player_state(c, uid):
                               FROM inventory i JOIN gifts g ON g.id=i.gift_id
                               LEFT JOIN favorites f ON f.inventory_id=i.id AND f.user_id=i.user_id
                               WHERE i.user_id=? ORDER BY i.acquired_at DESC, i.rowid DESC''', (uid,))
-    claims = rows(c, 'SELECT day,amount FROM daily_claims WHERE user_id=? ORDER BY day DESC LIMIT 20', (uid,))
     settings = row(c, 'SELECT sound,vibration,reduce_motion AS reduceMotion,show_on_leaderboard AS showOnLeaderboard FROM settings WHERE user_id=?', (uid,))
     notifications = rows(c, 'SELECT id,kind,title,message,read_at AS readAt,created_at AS createdAt FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 40', (uid,))
     weights = sum(w for _, w in PRIZE_WEIGHTS)
+    wishlist = [x['gift_id'] for x in rows(c, 'SELECT gift_id FROM wishlist WHERE user_id=?', (uid,))]
     return {
-        'user': public_user(user), 'gifts': gifts, 'inventory': inventory,
+        'user': public_user(user), 'gifts': [{**g, 'wishlisted': g['id'] in wishlist} for g in gifts], 'inventory': inventory, 'wishlist': wishlist,
         'ledger': rows(c, 'SELECT id,delta,reason,metadata,created_at AS createdAt FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 50', (uid,)),
         'spins': rows(c, '''SELECT s.id,s.cost,s.created_at AS createdAt,g.title,g.emoji,g.rarity,g.id AS giftId
                              FROM spins s JOIN gifts g ON g.id=s.prize_gift_id WHERE s.user_id=? ORDER BY s.id DESC LIMIT 30''', (uid,)),
         'progress': progress(c, uid), 'spinCost': SPIN_COST,
         'probabilities': [{'giftId': gid, 'weight': w, 'probabilityPercent': round(w / weights * 100, 2)} for gid, w in PRIZE_WEIGHTS],
-        'daily': {'reward': DAY_REWARD, 'today': utc_day(), 'claimed': any(cl['day'] == utc_day() for cl in claims), 'history': claims},
+        'daily': daily_summary(c, uid),
+        'promoHistory': rows(c, 'SELECT code,amount,created_at AS createdAt FROM promo_redemptions WHERE user_id=? ORDER BY created_at DESC', (uid,)),
         'settings': settings or {'sound': 1, 'vibration': 1, 'reduceMotion': 0, 'showOnLeaderboard': 1},
         'notifications': notifications,
         'unreadCount': sum(n['readAt'] is None for n in notifications),
@@ -676,6 +767,24 @@ def api_dispatch(c, method, path, data, headers, query):
         return buy(c, uid, data.get('giftId'), headers.get('x-idempotency-key'))
     if method == 'POST' and path == '/api/daily/claim':
         return daily(c, uid)
+    if method == 'POST' and path == '/api/missions/claim':
+        require_body(data, {'missionId'})
+        return claim_mission(c, uid, require_string(data.get('missionId'), 'missionId', 1, 60))
+    if method == 'POST' and path == '/api/achievements/claim':
+        require_body(data, {'achievementId'})
+        return claim_achievement(c, uid, require_string(data.get('achievementId'), 'achievementId', 1, 60))
+    if method == 'PATCH' and re.fullmatch(r'/api/wishlist/[A-Za-z0-9_-]{1,100}', path):
+        require_body(data, {'favorite'})
+        gid = path.split('/')[3]
+        if not isinstance(data.get('favorite'), bool):
+            fail('BAD_REQUEST', 'Неверный параметр избранного.')
+        if not gift_row(c, gid):
+            fail('NOT_FOUND', 'Предмет не найден.', 404)
+        if data['favorite']:
+            c.execute('INSERT OR IGNORE INTO wishlist(user_id,gift_id) VALUES(?,?)', (uid, gid))
+        else:
+            c.execute('DELETE FROM wishlist WHERE user_id=? AND gift_id=?', (uid, gid))
+        return {'giftId': gid, 'favorite': data['favorite']}
     if method == 'POST' and path == '/api/promo/redeem':
         require_body(data, {'code'})
         return redeem(c, uid, data.get('code'))
@@ -748,7 +857,9 @@ BOT_COMMANDS = [
     ('inventory', '🎁 Мои подарки'), ('market', '🛍 Каталог подарков'),
     ('wheel', '🎡 Колесо удачи'), ('spin', '🎡 Вращать колесо'),
     ('profile', '👤 Мой профиль'), ('top', '🏆 Рейтинг'),
-    ('promo', '🎟 Промокод'), ('help', '❓ Список команд')
+    ('promo', '🎟 Промокод'), ('tasks', '☑️ Мои задания'),
+    ('achievements', '🏅 Достижения'), ('favorites', '❤️ Избранное'),
+    ('help', '❓ Список команд')
 ]
 
 
@@ -779,7 +890,8 @@ def button_rows():
     result += [
         [{'text': '💰 Баланс', 'callback_data': 'balance'}, {'text': '📅 Бонус', 'callback_data': 'daily'}],
         [{'text': '🎁 Подарки', 'callback_data': 'inventory'}, {'text': '🛍 Маркет', 'callback_data': 'market'}],
-        [{'text': '🎡 Колесо', 'callback_data': 'wheel'}, {'text': '🏆 Топ игроков', 'callback_data': 'top'}],
+        [{'text': '🎡 Колесо', 'callback_data': 'wheel'}, {'text': '☑️ Задания', 'callback_data': 'tasks'}],
+        [{'text': '🏅 Достижения', 'callback_data': 'achievements'}, {'text': '🏆 Рейтинг', 'callback_data': 'top'}],
         [{'text': '👤 Профиль', 'callback_data': 'profile'}, {'text': '❓ Помощь', 'callback_data': 'help'}]
     ]
     return {'inline_keyboard': result}
@@ -863,6 +975,41 @@ def process_command(c, sender, cmd, argument='', op_key=''):
             return '🎟 Введи /promo FROGI2026\nКаждый промокод работает один раз.', menu
         result = redeem(c, uid, argument)
         return f'🎟 Промокод {result["code"]} активирован! +{result["reward"]} FC\nБаланс: {result["user"]["balance"]} FC', menu
+    if cmd in ('tasks', 'missions'):
+        tasks = progress(c, uid)['missions']
+        result = '\n'.join(f'{"✅" if m["claimed"] else "🎁" if m["completed"] else "▫️"} '
+                           f'{m["title"]} — {m["current"]}/{m["target"]} '
+                           f'(+{m["reward"]} FC)'
+                           + (f'\n/claimmission {m["id"]}' if m['completed'] and not m['claimed'] else '')
+                           for m in tasks)
+        return '☑️ ЗАДАНИЯ\n\n' + result + '\n\nВыдача наград — один раз.', menu
+    if cmd == 'claimmission':
+        result = claim_mission(c, uid, argument)
+        return f'🎁 Задание завершено! +{result["reward"]} FC\nБаланс: {result["user"]["balance"]} FC', menu
+    if cmd == 'achievements':
+        items = progress(c, uid)['achievements']
+        result = '\n'.join(f'{"✅" if a["claimed"] else "🎁" if a["unlocked"] else "🔒"} '
+                           f'{a["title"]} — {a["current"]}/{a["threshold"]}'
+                           + (f'\n/claimach {a["id"]}' if a['unlocked'] and not a['claimed'] else '')
+                           for a in items)
+        return '🏅 ДОСТИЖЕНИЯ\n\n' + result, menu
+    if cmd == 'claimach':
+        result = claim_achievement(c, uid, argument)
+        return f'🏅 Достижение! +{result["reward"]} FC\nБаланс: {result["user"]["balance"]} FC', menu
+    if cmd == 'favorites':
+        mine = rows(c, """SELECT g.emoji,g.title FROM inventory i JOIN favorites f ON f.inventory_id=i.id
+                         JOIN gifts g ON g.id=i.gift_id WHERE f.user_id=? LIMIT 12""", (uid,))
+        wished = rows(c, """SELECT g.emoji,g.title FROM wishlist w JOIN gifts g ON g.id=w.gift_id
+                           WHERE w.user_id=? LIMIT 12""", (uid,))
+        own_text = '\n'.join(x['emoji']+' '+x['title'] for x in mine) or 'Пока пусто'
+        wished_text = '\n'.join(x['emoji']+' '+x['title'] for x in wished) or 'Пока пусто'
+        return '❤️ ИЗБРАННОЕ\n\nВ коллекции:\n'+own_text+'\n\nСписок желаний:\n'+wished_text, menu
+    if cmd == 'wishlist':
+        gift_id = argument.strip()
+        if not gift_row(c, gift_id):
+            fail('NOT_FOUND', 'Предмет не найден.', 404)
+        c.execute('INSERT OR IGNORE INTO wishlist(user_id,gift_id) VALUES(?,?)', (uid,gift_id))
+        return '❤️ Предмет сохранён в избранное. /favorites', menu
     if cmd == 'news':
         return '📰 НОВОСТИ\n\n' + '\n\n'.join(n['icon'] + ' ' + n['title'] + '\n' + n['text'] for n in NEWS), menu
     if cmd == 'admin':
@@ -993,7 +1140,7 @@ def poll_telegram():
 # ---------------------------------------------------------------------------
 # Single-file HTTP server, static UI, JSON API, Render health, Telegram webhook.
 # ---------------------------------------------------------------------------
-HTML = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#090a0f"><meta name="description" content="FROGI Arena - Telegram Mini App"><title>FROGI Arena</title><script src="https://telegram.org/js/telegram-web-app.js"></script><style>@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
+HTML = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#090909"><meta name="description" content="FROGI Arena - Telegram Mini App"><title>FROGI Arena</title><script src="https://telegram.org/js/telegram-web-app.js"></script><style>@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
 :root{font-family:Manrope,Inter,system-ui,-apple-system,sans-serif;color:#f5f5f8;background:#09090d;font-synthesis:none;text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased;--bg:#09090d;--panel:#121218;--panel2:#17171f;--muted:#898996;--line:#25252e;--red:#ff3559;--blue:#3988ff;--green:#62e5b2}
 *{box-sizing:border-box}body{margin:0;min-width:320px;background:radial-gradient(ellipse at 50% -10%,#1a1118 0%,#09090d 42%);min-height:100vh}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.45}.app-shell{max-width:600px;margin:0 auto;min-height:100vh;padding:0 17px 95px;position:relative;overflow:hidden}.topbar{height:76px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff0c}.brand{display:flex;align-items:center;gap:11px}.brand-mark{width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,#ff4c69,#9e102b);display:grid;place-items:center;font-weight:900;font-size:21px;box-shadow:0 5px 25px #ff355928;letter-spacing:-3px}.brand-mark span{color:#111}.brand-name{font-weight:900;letter-spacing:2px;font-size:16px}.brand-name span{font-size:8px;color:var(--red);vertical-align:top}.brand-sub{font-size:8px;letter-spacing:1.2px;color:#858590;margin-top:3px}.icon-button{width:38px;height:38px;border:1px solid var(--line);border-radius:12px;background:#15151b;color:#d8d8df;display:grid;place-items:center}.demo-banner{display:flex;align-items:center;gap:7px;margin-top:12px;padding:9px 11px;background:#17171f;border:1px solid #34303c;border-radius:10px;color:#c6c6d1;font-size:9px;font-weight:800;letter-spacing:.4px}.demo-banner svg{color:#f4bb57}.error-banner{display:flex;align-items:center;gap:9px;padding:11px;margin-top:10px;border:1px solid #6d2836;background:#29131a;border-radius:10px;color:#ffb5c2;font-size:12px}.error-banner span{flex:1}.error-banner button{border:0;background:transparent;color:inherit;font-size:20px}.main-content{padding-top:18px}.page{display:flex;flex-direction:column;gap:18px}.enter{animation:enter .3s ease both}@keyframes enter{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}.hero-card{position:relative;isolation:isolate;overflow:hidden;min-height:284px;border-radius:24px;border:1px solid #ffffff12;background:linear-gradient(120deg,#1d1119 0%,#11131e 65%,#0f1422 100%);padding:22px 20px}.hero-glow{position:absolute;width:180px;height:180px;border-radius:50%;filter:blur(55px);opacity:.24;z-index:-1}.glow-red{background:#ff174a;right:5px;top:45px}.glow-blue{background:#1c6cff;right:-50px;bottom:-90px}.eyebrow{display:flex;align-items:center;gap:7px;color:#d2d2db;font-size:9px;font-weight:800;letter-spacing:1.7px}.live-dot{width:6px;height:6px;background:#ff3559;border-radius:50%;box-shadow:0 0 10px #ff3559}.hero-pill{border:1px solid #ff355954;border-radius:5px;color:#ff6e87;padding:3px 5px;font-size:8px;letter-spacing:.5px}.hero-card h1{font-size:29px;line-height:1.15;letter-spacing:-1.2px;margin:20px 0 10px;font-weight:800;position:relative;z-index:2}.hero-card h1 span{color:#ff4a68}.hero-card p{font-size:11px;line-height:1.7;color:#b3b2c0;max-width:245px;margin:0 0 17px;position:relative;z-index:2}.primary-button{display:inline-flex;align-items:center;justify-content:center;gap:9px;border:0;border-radius:12px;padding:12px 16px;color:white;font-weight:800;font-size:12px;background:linear-gradient(100deg,#ff3658,#db1741);box-shadow:0 7px 22px #ff174a26;transition:transform .2s,filter .2s}.primary-button:active{transform:scale(.98)}.hero-art{position:absolute;width:160px;height:160px;right:-3px;bottom:9px;display:grid;place-items:center}.frog-emoji{font-size:78px;filter:drop-shadow(0 8px 15px #0008);z-index:2;animation:bob 3s ease-in-out infinite}@keyframes bob{50%{transform:translateY(-7px) rotate(3deg)}}.orbit{position:absolute;border:1px solid #ffffff25;border-radius:50%;transform:rotate(-24deg)}.orbit-a{width:146px;height:72px}.orbit-b{width:122px;height:140px;transform:rotate(55deg);border-color:#ff35594a}.art-chip{position:absolute;background:#171722;border:1px solid #ffffff20;border-radius:7px;padding:6px 8px;font-size:8px;font-weight:900;letter-spacing:1px;box-shadow:0 5px 15px #0008}.chip-one{top:13px;right:16px;color:#ff6980}.chip-two{bottom:18px;left:4px;color:#7bb2ff}.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.stat-card{background:linear-gradient(145deg,#15151d,#101015);border:1px solid var(--line);border-radius:17px;padding:14px;display:flex;flex-direction:column;align-items:flex-start;min-width:0}.stat-icon{width:31px;height:31px;border-radius:10px;display:grid;place-items:center;margin-bottom:13px}.stat-icon.red{color:#ff5470;background:#ff35591a}.stat-icon.blue{color:#6eabff;background:#3988ff1c}.stat-label{font-size:10px;color:#9d9daa}.stat-card strong{font-size:23px;letter-spacing:-.7px;margin:6px 0 8px}.stat-card strong small{font-size:10px;color:#a4a4b2;letter-spacing:0}.stat-card button{display:flex;align-items:center;gap:3px;background:transparent;border:0;padding:0;color:#ff6980;font-size:10px;font-weight:700}.section-title{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:5px}.section-kicker{font-size:8px;letter-spacing:1.5px;color:#72727f;font-weight:800}.section-title h2{font-size:21px;letter-spacing:-.6px;margin:4px 0 0;font-weight:800}.section-note{font-size:10px;color:#8d8d9a;white-space:nowrap;margin-bottom:3px}.quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.quick-card{display:flex;justify-content:space-between;align-items:flex-start;text-align:left;border-radius:16px;padding:14px;border:1px solid #ffffff12;color:#fff;min-height:105px}.quick-card>div{display:flex;flex-direction:column;align-items:flex-start;gap:9px}.quick-card span{font-size:11px;font-weight:800}.quick-card small{font-size:9px;color:#a7a7b4}.quick-card.quick-red{background:linear-gradient(135deg,#30121c,#171117)}.quick-red>div>svg{color:#ff5270}.quick-card.quick-blue{background:linear-gradient(135deg,#111e36,#12151f)}.quick-blue>div>svg{color:#69a6ff}.quick-card>svg{color:#b4b4c0}.gift-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.gift-card{position:relative;overflow:hidden;min-width:0;background:linear-gradient(145deg,#1a1a24,#111117);border:1px solid #ffffff12;border-radius:16px;padding:12px}.rarity-rare{background:linear-gradient(145deg,#20141b,#121117)}.rarity-epic{background:linear-gradient(145deg,#17172b,#101017)}.rarity-legendary{background:linear-gradient(145deg,#282116,#131218)}.gift-card-top{display:flex;justify-content:space-between;align-items:center;position:relative;z-index:1}.rarity-tag{font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;color:#ff7188;background:#ff355918;padding:5px 7px;border-radius:5px}.rarity-epic .rarity-tag{color:#a49bff;background:#8173ff18}.rarity-legendary .rarity-tag{color:#f0cb77;background:#f0cb7718}.gift-dots{font-size:10px;letter-spacing:2px;color:#656572}.gift-art{height:105px;display:grid;place-items:center;position:relative}.gift-art>span{font-size:52px;z-index:1;filter:drop-shadow(0 8px 13px #0008)}.gift-orbit{position:absolute;width:76px;height:42px;border:1px solid #ff35592c;border-radius:50%;transform:rotate(-25deg)}.rarity-epic .gift-orbit{border-color:#8173ff45}.rarity-legendary .gift-orbit{border-color:#f0cb7740}.gift-details strong{font-size:12px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gift-details p{font-size:9px;color:#9999a7;line-height:1.55;margin:6px 0 1px;min-height:28px}.section-foot{display:flex;justify-content:space-between;align-items:center;color:#8e8e9b;font-size:10px}.section-foot button{display:flex;align-items:center;gap:4px;border:0;background:transparent;color:#ff617b;font-size:10px;font-weight:800}.bottom-nav{position:fixed;z-index:20;bottom:0;left:50%;transform:translateX(-50%);width:min(600px,100%);padding:10px 8px calc(10px + env(safe-area-inset-bottom));background:#101015ed;backdrop-filter:blur(18px);border-top:1px solid #ffffff10;display:flex;justify-content:space-around;gap:2px}.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;min-width:0;background:transparent;border:0;color:#777784;padding:5px 1px;font-size:8px;font-weight:700}.nav-item.active{color:#ff4c69}.nav-item.active svg{filter:drop-shadow(0 0 7px #ff35594d)}.admin-nav{opacity:.8}.footer-note{text-align:center;color:#53535f;font-size:7px;letter-spacing:1px;padding:18px 0 0}.wheel-intro{color:#a6a6b3;font-size:11px;line-height:1.7;background:#14141b;border:1px solid var(--line);border-radius:12px;padding:12px}.wheel-intro b{color:#ff617b}.wheel-stage{height:310px;display:grid;place-items:center;position:relative;overflow:hidden}.wheel-ring{width:226px;height:226px;border-radius:50%;border:9px solid #2b2b36;box-shadow:0 0 0 3px #ff355926,0 0 40px #ff355916,inset 0 0 30px #000a;background:conic-gradient(from -45deg,#4d1b2c 0deg 90deg,#172e4d 90deg 180deg,#322052 180deg 270deg,#4b3920 270deg 360deg);position:relative;display:grid;place-items:center;transition:transform 1.6s cubic-bezier(.12,.76,.13,1)}.wheel-running .wheel-ring{transform:rotate(1080deg)}.wheel-core{width:76px;height:76px;border-radius:50%;border:4px solid #33333f;background:linear-gradient(145deg,#20202b,#0d0d12);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:27px;box-shadow:0 5px 18px #000a;z-index:2}.wheel-core small{font-size:7px;font-weight:900;letter-spacing:1px;color:#ff5470;margin-top:2px}.wheel-pointer{position:absolute;top:23px;z-index:4;width:0;height:0;border-left:12px solid transparent;border-right:12px solid transparent;border-top:25px solid #ff4766;filter:drop-shadow(0 2px 5px #ff35596b)}.wheel-prize{position:absolute;top:50%;left:50%;margin:-22px 0 0 -22px;transform-origin:22px 22px;width:44px;height:44px;display:grid;place-items:center}.wheel-prize span{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;font-size:22px;box-shadow:0 4px 15px #0005}.wheel-shadow{position:absolute;bottom:22px;width:190px;height:20px;border-radius:50%;background:#0008;filter:blur(14px)}.spin-button{width:100%;min-height:48px}.win-card{display:flex;align-items:center;gap:12px;padding:14px;border:1px solid #f0cb7745;background:linear-gradient(110deg,#302315,#17141a);border-radius:14px;animation:enter .3s ease}.win-spark{width:42px;height:42px;border-radius:13px;background:#f0cb771b;color:#f0cb77;display:grid;place-items:center}.win-card>div:last-child{display:flex;flex-direction:column;gap:4px}.win-card span{font-size:8px;letter-spacing:1.2px;color:#f0cb77;font-weight:900}.win-card strong{font-size:14px}.win-card small{font-size:9px;color:#a8a5a1}.probability-panel{margin-top:5px}.prob-list{display:flex;flex-direction:column;gap:12px}.prob-row{display:flex;align-items:center;gap:9px;font-size:10px}.prob-emoji{font-size:18px;width:26px;text-align:center}.prob-name{width:88px;color:#c8c8d2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prob-bar{height:5px;border-radius:9px;background:#262630;flex:1;overflow:hidden}.prob-bar i{display:block;height:100%;background:linear-gradient(90deg,#ff3559,#438dff);border-radius:9px;min-width:2px}.prob-row>b{width:42px;text-align:right;font-size:10px}.tiny-note{color:#747482;font-size:9px;line-height:1.65;margin:0}.center{text-align:center}.muted{color:#888895;font-size:11px}.market-banner{display:flex;gap:12px;align-items:center;padding:14px;border-radius:14px;background:linear-gradient(100deg,#25121a,#131521);border:1px solid #ffffff12;color:#ff617b}.market-banner div{display:flex;flex-direction:column;gap:4px}.market-banner b{font-size:12px;color:#fff}.market-banner span{font-size:9px;color:#aaaab7}.market-card{min-width:0}.market-card-bottom{display:flex;align-items:center;justify-content:space-between;gap:5px;padding:9px 2px}.market-card-bottom>div{display:flex;flex-direction:column;gap:3px}.market-card-bottom strong{font-size:13px}.market-card-bottom strong small{font-size:9px;color:#9999a7}.market-card-bottom span{font-size:9px;color:#8b8b99}.market-card-bottom button,.admin-form button{background:#ff3559;color:#fff;border:0;border-radius:9px;padding:9px 12px;font-size:10px;font-weight:800}.inventory-wrap{min-width:0}.acquired{font-size:8px;color:#777784;padding:7px 2px}.empty-state{padding:36px 18px;text-align:center;border:1px dashed #33333f;border-radius:17px;background:#111117}.empty-state>div{color:#ff5772;margin-bottom:12px}.empty-state strong{font-size:13px}.empty-state p{font-size:10px;line-height:1.6;color:#9696a4;max-width:240px;margin:8px auto 0}.wallet-card{padding:19px;border:1px solid #ffffff16;border-radius:20px;background:radial-gradient(circle at 100% 0%,#34202b 0%,transparent 48%),linear-gradient(140deg,#191920,#101016);box-shadow:0 12px 32px #0003}.wallet-card-top{display:flex;align-items:center;justify-content:space-between;color:#a5a5b2;font-size:9px;font-weight:800;letter-spacing:.8px}.wallet-card-top span:first-child{display:flex;align-items:center;gap:8px}.wallet-card-top svg{color:#ff5772}.demo-chip{border-radius:5px;padding:4px 6px;background:#ff35591c;color:#ff6b83}.wallet-card>strong{display:block;font-size:34px;letter-spacing:-1px;margin:20px 0 7px}.wallet-card>strong small{font-size:13px;color:#aaaab7}.wallet-card p{color:#9999a7;font-size:10px;line-height:1.7;margin:0 0 17px;max-width:360px}.wallet-actions{display:flex;gap:9px}.wallet-actions button{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 5px;border-radius:10px;border:1px solid #ffffff14;background:#202028;color:#aaaab7;font-size:10px;font-weight:800}.network-note{display:flex;align-items:flex-start;gap:10px;padding:13px;border:1px solid #26354d;background:#101722;border-radius:13px;color:#70aaff}.network-note div{display:flex;flex-direction:column;gap:5px}.network-note b{font-size:11px;color:#d9e5ff}.network-note span{font-size:9px;line-height:1.6;color:#a0aabb}.ledger-list{display:flex;flex-direction:column;gap:1px}.ledger-row{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid #ffffff0b}.ledger-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:#1a1a24;color:#a0a0ae}.ledger-main{flex:1;display:flex;flex-direction:column;gap:4px;min-width:0}.ledger-main b{font-size:10px;text-transform:capitalize}.ledger-main span{font-size:8px;color:#777784}.ledger-row>strong{font-size:11px;white-space:nowrap}.positive{color:#62e5b2!important}.negative{color:#ff7188!important}.admin-warning{display:flex;gap:9px;align-items:center;padding:12px;border:1px solid #634b25;background:#211b12;color:#e6c37d;border-radius:11px;font-size:10px;line-height:1.5}.admin-login,.admin-form{display:flex;flex-direction:column;gap:12px;padding:14px;background:#131319;border:1px solid var(--line);border-radius:14px}.admin-login label,.admin-form label{display:flex;flex-direction:column;gap:6px;font-size:9px;color:#9b9ba8;font-weight:800;letter-spacing:.6px}.admin-login input,.admin-form input{width:100%;background:#09090e;border:1px solid #30303b;border-radius:9px;padding:11px;color:#f5f5f8;outline:none;font-size:12px}.admin-login input:focus,.admin-form input:focus{border-color:#ff4c69}.admin-stats{display:grid;grid-template-columns:1fr 1fr;gap:9px}.admin-stats>div{display:flex;flex-direction:column;gap:8px;background:#14141b;border:1px solid var(--line);padding:13px;border-radius:12px}.admin-stats span{font-size:9px;color:#9999a7}.admin-stats b{font-size:21px}.subheading{font-size:13px;margin:4px 0 -7px}.admin-table{border:1px solid var(--line);border-radius:12px;overflow:hidden}.admin-table>button,.admin-table>div{width:100%;display:flex;justify-content:space-between;align-items:center;gap:8px;text-align:left;padding:11px;background:#131319;border:0;border-bottom:1px solid #ffffff0b;color:#eee}.admin-table>button:last-child,.admin-table>div:last-child{border-bottom:0}.admin-table span{display:flex;flex-direction:column;gap:4px;min-width:0}.admin-table b{font-size:10px}.admin-table small{font-size:8px;color:#7f7f8d;overflow:hidden;text-overflow:ellipsis;max-width:220px}.admin-table strong{font-size:10px;white-space:nowrap}.loading{min-height:55vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#9a9aa7;font-size:12px}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(min-width:500px){.app-shell{padding-left:22px;padding-right:22px}.hero-card{min-height:310px;padding:26px}.hero-card h1{font-size:34px}.hero-art{right:10px;transform:scale(1.1)}.gift-art{height:120px}}@media(max-width:370px){.app-shell{padding-left:12px;padding-right:12px}.hero-card{padding:17px}.hero-card h1{font-size:25px}.hero-art{right:-27px;transform:scale(.86)}.gift-card{padding:9px}.gift-art{height:90px}.nav-item{font-size:7px}.section-title h2{font-size:19px}}
 
@@ -1507,16 +1654,29 @@ html.reduce-motion *, html.reduce-motion *::before, html.reduce-motion *::after 
 @media(max-width:850px){.f-gift-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ach-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:600px){.topbar{padding:8px 14px}.main-content{padding:15px 14px 26px}.page{gap:18px}.f-hero{min-height:290px;padding:25px}.f-hero-content{max-width:85%}.f-hero-content h1{font-size:34px}.f-hero-content p{font-size:12px}.f-hero-deco{font-size:106px;opacity:.45;right:-15px;top:15%}.f-stat-grid{gap:7px}.f-stat{padding:11px;border-radius:12px}.f-stat small{font-size:8px}.f-stat strong{font-size:20px}.f-stat>span{font-size:9px}.quick-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.quick-tile{min-height:100px;padding:12px}.quick-tile strong{font-size:11px}.quick-tile>span:first-child{font-size:22px}.f-gift-grid{gap:9px}.gift-visual{height:113px}.gift-visual>span{font-size:49px}.gift-body{padding:11px;gap:7px}.gift-body h3{font-size:13px}.gift-body p{font-size:10px}.gift-footer strong{font-size:12px}.f-btn.tiny{padding:7px 9px}.f-daily{gap:10px;padding:12px}.daily-pic{width:46px;height:49px}.daily-info h3{font-size:13px}.daily-info p{font-size:10px}.f-btn.daily-btn{width:39px;min-width:39px;height:40px;font-size:19px}.f-controls{flex-wrap:wrap}.f-controls select{max-width:none}.mission-list{grid-template-columns:1fr}.ach-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.tile-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.f-banner{padding:17px;gap:11px}.f-banner>span{font-size:36px}.f-banner h3{font-size:15px}.f-banner p{font-size:11px}.f-banner>.f-btn{padding:8px}.f-mission{padding:10px}.profile-avatar{width:70px;height:70px;font-size:39px}.profile-hero{padding:16px}.profile-hero h2{font-size:18px}.bottom-nav{padding-bottom:calc(6px + env(safe-area-inset-bottom))}.nav-link span{font-size:22px}.nav-link small{font-size:9px}.brand-mark{width:37px;height:37px}.brand-name{font-size:18px}.brand-sub{font-size:7px}.balance-pill{padding:9px;font-size:11px}.icon-button{width:34px;height:34px}.section-title span{font-size:9px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition-duration:.01ms!important;animation-duration:.01ms!important}.wheel-face{transition-duration:.01ms!important}}html.reduce-motion *{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}
+
+/* FROGI ARENA 3.0 — minimal black/burgundy design system. Overrides legacy styles. */
+:root{font-family:Inter,Manrope,system-ui,-apple-system,sans-serif;--bg:#080809;--panel:#101012;--panel2:#171518;--line:#292226;--muted:#99959b;--red:#bc304d;--green:#bd3854;--accent:#a51f3d;color:#f5f3f3;background:var(--bg);color-scheme:dark}
+html{scroll-behavior:smooth}body{min-width:320px;background:#080809;color:#f5f3f3;line-height:1.5}button,input,select,textarea{font-family:inherit}button{transition:background .18s,border-color .18s,transform .18s}button:hover:not(:disabled){border-color:#873044}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid #b03953;outline-offset:2px}::selection{background:#a52c47;color:white}
+.app-shell{max-width:none;min-height:100vh;padding:0;overflow:visible;background:radial-gradient(ellipse at 65% -25%,#24101545,transparent 55%),#090909}.topbar{height:80px;padding:0 32px 0 27px;background:#090909ed;border-bottom:1px solid #ffffff0e;display:grid;grid-template-columns:222px minmax(0,1fr) auto;gap:24px;align-items:center;position:sticky;top:0;z-index:30;backdrop-filter:blur(15px)}.brand-button{border:0;background:transparent;color:#fff;display:inline-flex;align-items:center;text-align:left;padding:0;gap:10px;justify-self:start}.brand-mark{width:45px;height:45px;background:none;border:0;border-radius:0;box-shadow:none;display:grid;place-items:center;letter-spacing:0}.frog-symbol{display:block;width:100%;height:100%}.brand-text{display:flex;flex-direction:column;gap:0}.brand-text b{font-weight:800;letter-spacing:.26em;font-size:21px;line-height:1.22}.brand-text small{font-size:9px;letter-spacing:.55em;color:#bc3653;text-align:center;margin-top:3px}.desktop-tabs{height:100%;display:flex;align-items:center;justify-content:center;gap:clamp(12px,2.6vw,39px)}.desktop-tabs button{height:100%;position:relative;border:0;border-radius:0;background:none;color:#bbb6ba;font-size:12px;font-weight:600;padding:0 3px;white-space:nowrap}.desktop-tabs button.active,.desktop-tabs button:hover{color:#fff}.desktop-tabs button.active:after{content:"";position:absolute;bottom:0;left:0;right:0;height:2px;background:#b22845}.header-actions{display:flex;align-items:center;gap:10px}.user-chip{display:flex;align-items:center;gap:10px;min-width:185px;text-align:left;border:1px solid #252024;background:#100e0f;color:#eee;border-radius:11px;padding:8px 11px}.user-chip>span:nth-child(2){display:flex;flex-direction:column;flex:1;min-width:0}.user-chip b{font-size:11px;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.user-chip small{font-size:10px;color:#a7a0a3}.tiny-frog{width:33px;height:33px;border-radius:50%;border:1px solid #84223d;background:#1d1014;display:grid;place-items:center;padding:4px}.chip-arrow{color:#857981}.icon-button{width:40px;height:40px;color:#cfc9cb;background:#100f10;border:1px solid #272224;border-radius:50%;font-size:20px}.balance-pill{border:1px solid #3a2630;border-radius:9px;background:#171015;color:#fff;padding:10px 13px;display:flex;align-items:center;gap:7px;font-size:12px}.balance-pill>span{color:#e05b7a}.balance-pill small{font-size:10px;color:#b7a4aa}.notification-shortcut i{background:#ad2846}
+.app-body{display:grid;grid-template-columns:250px minmax(0,1fr);min-height:calc(100vh - 80px)}.sidebar{border-right:1px solid #ffffff0f;min-width:0;display:flex;flex-direction:column;padding:30px 18px 22px 26px;background:linear-gradient(160deg,#090909,#0c0a0b 75%,#120a0d)}.sidebar nav{display:flex;flex-direction:column;gap:5px}.side-link{display:flex;align-items:center;gap:16px;width:100%;color:#b8b4b6;background:none;border:1px solid transparent;border-radius:9px;padding:12px 14px;font-size:12px;font-weight:600;text-align:left;min-height:47px}.side-link .side-icon{display:grid;place-items:center;width:22px;font-size:20px;font-weight:400;color:#9e999a}.side-link.active{color:#fff;background:linear-gradient(95deg,#34151e9e,#1b1215a8);border-color:#4c1c2a58}.side-link.active .side-icon{color:#e24b6e}.side-link em{font-style:normal;margin-left:auto;background:#a82944;border-radius:20px;min-width:18px;text-align:center;font-size:10px;padding:1px 4px}.sidebar-bottom{margin-top:auto;margin-bottom:20px;padding:22px 17px;border:1px solid #351e26;border-radius:10px;background:linear-gradient(175deg,#1b1015,#0e0b0d 75%)}.sidebar-bottom>b{font-size:13px;letter-spacing:.22em}.sidebar-bottom>b span{display:block;color:#d34864;letter-spacing:.4em;font-size:9px;margin-top:3px}.sidebar-bottom p{font-size:11px;line-height:1.8;color:#a69ba0;margin:14px 0 17px}.sidebar-bottom button{width:100%;padding:10px;border-radius:8px;background:#120d0f;color:#eee;border:1px solid #7a283e;font-size:11px;text-align:left}.side-secondary{display:grid;grid-template-columns:1fr 1fr;gap:9px}.side-secondary button{background:none;border:0;color:#777078;font-size:10px;text-align:left;padding:6px 0}.side-secondary button:hover{color:#fff}.content-column{min-width:0;margin:0 auto;width:100%;max-width:1800px}.demo-banner{margin:0;border:0;border-radius:0;border-bottom:1px solid #ffffff0a;background:#0d0b0c;min-height:31px;padding:7px 38px;color:#93888c;letter-spacing:.09em;font-size:9px;font-weight:700}.mini-pulse{width:5px;height:5px;background:#b83450;display:inline-block;border-radius:50%;margin-right:7px}.main-content{padding:25px clamp(17px,2.4vw,42px) 38px}.site-foot{padding:12px 40px 28px;display:flex;justify-content:space-between;color:#574c51;font-size:10px;letter-spacing:.11em}.bottom-nav{display:none}.f-error,.f-toast{margin:15px 35px 0;background:#260f17;color:#f6bfc8;border:1px solid #8b3046;border-radius:9px;font-size:12px}.f-toast{color:#ffe1e6;background:#201319}.f-btn{border-radius:8px;padding:11px 16px;min-height:41px;font-size:12px;letter-spacing:.01em;font-weight:700;border:1px solid #463039;background:#171215;color:#ece4e5;box-shadow:none}.f-btn.primary,.f-btn.tiny,.f-btn.mini{background:linear-gradient(120deg,#9e203e,#74152c);border-color:#aa304a;color:#fff;box-shadow:none}.f-btn.outline{background:#100f10;color:#ddd7da;border:1px solid #46202c}.f-btn:hover:not(:disabled){filter:brightness(1.12);transform:translateY(-1px)}.f-btn:disabled{opacity:.52}.f-btn.wide{width:100%}.f-btn.tiny{min-height:35px;padding:8px 13px;font-size:11px}.f-btn.mini{font-size:10px;padding:7px 10px;min-height:30px}.f-input{background:#0b0b0c;color:#f3edf0;border:1px solid #343034;border-radius:8px;padding:12px 13px;font-size:12px}.f-input:focus{border-color:#ad304d}.f-muted{color:#aaa0a4;font-size:12px}.section-title{margin-top:7px}.section-title h2{font-size:21px;letter-spacing:-.03em;font-weight:750}.section-title span{font-size:11px;color:#887f85}.micro-label{font-size:10px;color:#dd536e;font-weight:750;letter-spacing:.23em}.badge-tag{background:#261920;color:#ca5069;border-radius:5px;padding:4px 8px;letter-spacing:.03em}.badge-tag.r-rare{color:#cf7b98;background:#291b25}.badge-tag.r-epic{color:#bfa7ca;background:#241e2b}.badge-tag.r-legendary{color:#e7b979;background:#30251a}.progress-track{height:7px;background:#2c272a;border-radius:6px;overflow:hidden}.progress-track i{background:linear-gradient(90deg,#8b213f,#df4564);border-radius:6px}.page{gap:20px}.page-heading{padding:12px 0 8px}.page-heading h1{font-size:clamp(28px,3vw,40px);font-weight:750;letter-spacing:-.035em}.page-heading p{color:#9d9498;font-size:13px}.page-heading .micro-label{color:#9e5263;font-size:9px}.f-box,.f-stat,.f-banner,.f-list,.prob-list,.wallet-hero,.wheel-view,.profile-hero,.f-tile,.f-gift,.market-showcase,.collection-overview{background:linear-gradient(148deg,#141113,#0d0d0e);border:1px solid #282327;border-radius:11px;box-shadow:none}.f-box{padding:22px}.f-banner{background:linear-gradient(120deg,#1a1014,#101011)}.f-banner>span{font-size:33px}.f-banner h3{color:#fff}.f-banner p{color:#a7a0a3}.positive{color:#bdddba}.negative{color:#ed91a3}.filter-chip{background:#120f11;color:#aaa1a7;border:1px solid #33292d;border-radius:7px;padding:9px 14px;font-size:11px}.filter-chip.selected{background:#651e31;border-color:#9f2b48;color:#fff}.filter-row{display:flex;gap:8px;flex-wrap:wrap}.f-stat-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.f-stat{padding:18px}.f-stat small{color:#9d929a;font-size:9px}.f-stat strong{font-weight:750;color:#fff;font-size:25px}.f-stat>span{color:#7f777c}.f-gift-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px}.f-gift{position:relative;overflow:hidden;border-color:#2b2529;background:#111012;border-radius:11px}.f-gift:hover{transform:translateY(-2px);border-color:#6e2e43}.gift-visual{height:150px;background:radial-gradient(circle at 52% 44%,#4a1b2b70,transparent 70%),#130f12;position:relative}.gift-visual>span{font-size:60px;filter:drop-shadow(0 10px 25px #13070aa8)}.gift-glow{opacity:.08}.gift-body{padding:14px}.gift-body h3{font-size:14px}.gift-body p{font-size:11px;color:#a49aa0}.gift-footer{margin-top:12px}.gift-footer strong{font-size:13px}.wishlist-heart{position:absolute;right:10px;top:10px;display:grid;place-items:center;color:#e6d4d9;border:1px solid #50313a;background:#160e12e8;border-radius:50%;width:30px;height:30px;font-size:17px;z-index:3}.wishlist-heart.selected{background:#601e33;color:#fff;border-color:#bb3d5b}.panel{background:linear-gradient(150deg,#111112,#0c0c0d);border:1px solid #2b2528;border-radius:11px;padding:20px;min-width:0}.panel-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:21px}.panel-heading>div{display:flex;align-items:center;gap:10px;min-width:0}.panel-heading h3{margin:0;font-size:13px;font-weight:750;color:#f5f1f3;white-space:normal}.panel-symbol{width:30px;height:30px;border:1px solid #34282c;background:#181517;border-radius:50%;display:grid;place-items:center;color:#d34967;font-size:18px;flex-shrink:0}.small-muted,.text-link{font-size:10px;color:#a39ba0}.text-link{border:0;background:transparent;white-space:nowrap;padding:6px 2px}.text-link:hover{color:#fff}.dashboard-page{gap:13px}.f-hero{min-height:262px;display:flex;align-items:center;position:relative;overflow:hidden;border-radius:12px;border:1px solid #271b20;padding:29px 34px;background:radial-gradient(circle at 76% 44%,#4f162b80,transparent 36%),linear-gradient(115deg,#101010 30%,#1b0b12 74%,#100b0e 100%)}.f-hero:before{content:"";position:absolute;right:0;bottom:0;width:55%;height:100%;background:radial-gradient(ellipse at 65% 100%,#a219361b,transparent 75%);pointer-events:none}.hero-copy{position:relative;z-index:2;max-width:58%}.hero-copy h1{font-size:clamp(28px,3.5vw,51px);font-weight:790;letter-spacing:-.045em;line-height:1.1;margin:14px 0 11px}.hero-copy h1 span{color:#e7dfe2}.hero-copy p{font-size:12px;max-width:430px;line-height:1.75;color:#ada1a6;margin-bottom:19px}.hero-actions{display:flex;flex-wrap:wrap;gap:10px}.hero-frog{position:absolute;right:8%;top:12%;width:32%;height:75%;opacity:.9;transform:rotate(-7deg);filter:drop-shadow(0 0 33px #9f1d3b7a)}.hero-frog .frog-symbol{width:100%;height:100%}.hero-caption{position:absolute;right:20px;top:35px;color:#b49ca4;letter-spacing:.28em;font-size:8px;text-align:right;line-height:2.1}.dash-top{display:grid;grid-template-columns:1fr 1.05fr .82fr;gap:12px}.balance-panel,.profile-panel,.f-daily{min-height:233px}.balance-big{display:flex;align-items:center;gap:13px;margin:28px 0 21px}.balance-avatar,.profile-badge{width:58px;height:58px;border-radius:50%;border:1px solid #a92749;background:#1a1014;padding:8px;display:grid;place-items:center;flex-shrink:0}.balance-big strong{font-size:clamp(26px,2.3vw,38px);line-height:1;font-weight:780;letter-spacing:-.05em}.balance-big span:not(.balance-avatar){color:#bdb5b9;font-size:13px}.balance-big small{display:block;margin-top:8px;color:#8c8389;font-size:10px}.balance-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.balance-actions .f-btn{padding:10px 7px;font-size:10px;min-height:35px}.f-daily{display:flex;flex-direction:column;gap:0;background:#100f10;border-color:#34252b;padding:20px}.f-daily .panel-heading{margin-bottom:18px}.daily-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}.daily-day{min-width:0;text-align:center;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;border:1px solid #2c2628;background:#181618;border-radius:7px;min-height:65px;padding:8px 1px}.daily-day .daily-icon{font-size:16px;color:#80777d}.daily-day strong{font-size:9px;font-weight:650;color:#8c858a}.daily-day small{font-size:8px;color:#786e75}.daily-day.received{border-color:#4a343e}.daily-day.received .daily-icon{color:#d25c79}.daily-day.selected{border-color:#b33554;background:#31141f}.daily-day.selected .daily-icon,.daily-day.selected strong,.daily-day.selected small{color:#f2e6eb}.daily-bottom{display:flex;flex-direction:column;gap:8px;margin-top:auto;padding-top:14px}.daily-bottom .f-btn{min-height:39px}.daily-bottom small{font-size:9px;color:#777177;text-align:center}.profile-row{display:flex;align-items:center;gap:11px;margin:22px 0}.profile-badge{width:53px;height:53px}.profile-row>div{min-width:0}.profile-row b{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.profile-row small{display:block;margin:2px 0 6px;color:#8e858a;font-size:9px;letter-spacing:.08em}.level-badge{display:inline-block;color:#e65d79;border:1px solid #66303f;background:#2c121c;border-radius:7px;padding:3px 9px;font-size:9px}.xp-label{display:flex;justify-content:space-between;gap:8px;font-size:9px;color:#948b8e;margin-bottom:9px}.xp-label b{font-weight:650;color:#c5bcc1}.dash-middle{display:grid;grid-template-columns:1fr 1fr;gap:12px}.achievement-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.achievement-item{min-width:0;border:1px solid #292429;background:#131113;border-radius:9px;display:flex;align-items:center;text-align:center;flex-direction:column;padding:13px 7px 10px;gap:6px}.achievement-item.unlocked{background:radial-gradient(ellipse at 50% -20%,#4c172973,transparent 85%),#141011;border-color:#512230}.achievement-emblem{height:58px;width:58px;display:grid;place-items:center;background:#160f13;border:1px solid #4b2631;border-radius:12px;font-size:27px;color:#dc4d6b}.achievement-item:not(.unlocked) .achievement-emblem{filter:grayscale(1);opacity:.5}.achievement-item b{font-size:10px;line-height:1.35;min-height:27px}.achievement-item small{font-size:9px;color:#897e86}.achievement-item p{font-size:10px;color:#9d9198;min-height:32px;margin:2px 0}.achievement-state,.achievement-locked{font-size:9px;color:#d18a9f;margin-top:auto}.achievement-locked{color:#756c72}.achievement-item .f-btn{margin-top:auto}.tasks-list{display:flex;flex-direction:column;gap:8px}.task-row{min-height:57px;border:1px solid #272327;border-radius:8px;padding:9px 11px;display:flex;align-items:center;gap:12px;background:#141313}.task-icon{width:37px;height:37px;background:#0a0a0b;border:1px solid #242025;border-radius:9px;display:grid;place-items:center;font-size:21px;flex-shrink:0}.task-desc{min-width:0;flex:1}.task-desc b{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.task-desc small{display:block;color:#948b91;font-size:9px;margin:2px 0 5px}.tiny-progress{height:3px;background:#31272d}.task-row .f-btn{min-height:30px;padding:5px 11px;font-size:10px}.task-count,.task-complete{color:#a79aa0;font-size:10px;white-space:nowrap}.task-complete{color:#cb899d}.dash-bottom{display:grid;grid-template-columns:1.1fr 1fr .8fr;gap:12px}.promo-area>p{margin:4px 0 15px}.promo-form{display:flex;gap:8px}.promo-form input{flex:1;min-width:0}.promo-form .f-btn{font-size:11px;padding:10px}.promo-area>small{display:block;margin-top:12px;color:#766e73;font-size:9px}.favorite-previews{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.favorite-mini{min-width:0;background:#141214;color:#ddd;border:1px solid #33272b;border-radius:8px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:9px 6px;text-align:center}.favorite-mini span{display:grid;place-items:center;width:100%;height:60px;background:radial-gradient(circle,#481828,transparent 70%);font-size:30px}.favorite-mini b{font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}.favorite-mini small{font-size:9px;color:#847a81}.empty-mini{display:flex;flex-direction:column;gap:6px;align-items:center;justify-content:center;grid-column:1/-1;color:#bd536b;font-size:35px}.empty-mini small{font-size:11px;color:#8d8187;text-align:center}.quick-actions-list{display:flex;flex-direction:column;gap:6px}.quick-actions-list button{display:flex;align-items:center;gap:9px;text-align:left;background:#181618;border:1px solid #262326;color:#ddd;border-radius:7px;padding:8px 11px}.quick-actions-list button>span{font-size:19px;color:#e15e79}.quick-actions-list button>b{flex:1;font-size:10px;font-weight:650}.quick-actions-list button small{display:block;color:#777077;font-size:9px;font-weight:400}.quick-actions-list button em{font-style:normal;font-size:16px;color:#888}
+.market-showcase,.collection-overview,.mission-top{padding:25px 29px;position:relative;overflow:hidden;background:radial-gradient(circle at 89% 50%,#5a1a2a60,transparent 36%),linear-gradient(130deg,#180e12,#101011);min-height:146px}.market-showcase>span,.collection-overview>div>span{color:#d25570;letter-spacing:.24em;font-size:10px;font-weight:750}.market-showcase h2,.collection-overview h2,.mission-top h2{font-size:clamp(22px,3vw,35px);line-height:1.2;letter-spacing:-.03em;margin:13px 0 7px}.market-showcase p,.collection-overview p,.mission-top p{font-size:12px;color:#a79aa0;margin:0}.collection-overview{display:flex;align-items:center;justify-content:space-between}.collection-overview h2 small,.mission-top h2 small{font-size:17px;color:#a6989d}.large-collection-mark{width:115px;height:115px;opacity:.65;filter:drop-shadow(0 0 20px #a4204280)}.mission-top{display:flex;align-items:center;justify-content:space-between}.mission-top-icon{font-size:78px;color:#78203a;line-height:1}.page-panel{padding:22px}.info-rows{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}.info-rows>div{padding:15px;background:#141214;border:1px solid #2a2528;border-radius:8px}.info-rows b{font-size:12px}.info-rows p{font-size:11px;color:#aaa0a5;line-height:1.7}.achievement-full{grid-template-columns:repeat(4,minmax(0,1fr))}.achievement-full .achievement-item{padding:17px 10px}.achievement-full .achievement-item b{font-size:12px}.achievement-full .achievement-emblem{width:65px;height:65px}.profile-hero{background:linear-gradient(120deg,#29121a,#120f11);border-color:#422331;padding:25px}.profile-avatar{width:88px;height:88px;border-radius:50%;background:#170e13;border:1px solid #8f3049;padding:16px;font-size:0}.profile-hero h2{font-size:24px}.profile-progress{padding:25px}.f-tile{background:#141214;color:#ddd;border-radius:9px}.f-tile span{color:#c84a67}.wallet-hero{background:linear-gradient(110deg,#24101a,#131114);border-color:#402431}.wheel-view{background:radial-gradient(circle at 50% 38%,#4d182b,transparent 60%),#110d10;border-color:#462030}.wheel-face{border-color:#39212c;background:conic-gradient(#651f36 0 25%,#242027 25% 50%,#a93a59 50% 75%,#261e22 75%)}.wheel-center{background:#1b1015;color:#d75673;border-color:#3e2330}.wheel-pointer{color:#d7506d}.prob-list{background:#111012}.mine-cell{background:#191216;border-color:#482536;color:#c07d93}.mine-cell.open{background:#342024}.duel{background:#151012}.duel-vs{color:#c83d5a}.startup-orbit{filter:drop-shadow(0 0 28px #aa234770)}
+@media(max-width:1370px){.topbar{grid-template-columns:210px minmax(0,1fr) auto;padding:0 20px}.app-body{grid-template-columns:210px minmax(0,1fr)}.sidebar{padding:24px 13px}.desktop-tabs{gap:16px}.dashboard-page .dash-top{grid-template-columns:1fr 1.1fr}.dashboard-page .profile-panel{grid-column:1/-1;min-height:0}.dashboard-page .profile-panel .profile-row{margin:10px 0}.dash-bottom{grid-template-columns:1fr 1fr}.dash-bottom .actions-panel{grid-column:1/-1}.quick-actions-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}.achievement-grid{gap:6px}.achievement-item{padding:10px 4px}.f-gift-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1050px){.desktop-tabs{display:none}.topbar{grid-template-columns:190px minmax(0,1fr);gap:10px}.header-actions{justify-content:end}.app-body{grid-template-columns:175px minmax(0,1fr)}.sidebar{padding:20px 9px}.side-link{gap:8px;padding:10px 8px;font-size:11px}.sidebar-bottom{padding:12px}.main-content{padding:19px}.f-hero{padding:25px}.f-hero .hero-caption{display:none}.dash-middle{grid-template-columns:1fr}.dash-top{grid-template-columns:1fr 1fr}.dash-bottom{grid-template-columns:1fr 1fr}}
+@media(max-width:740px){.app-shell{padding:0 0 calc(67px + env(safe-area-inset-bottom));min-height:100dvh}.topbar{height:62px;padding:0 14px;grid-template-columns:1fr auto;gap:5px}.brand-mark{width:36px;height:36px}.brand-text b{font-size:17px}.brand-text small{font-size:7px}.user-chip{display:none}.balance-pill{padding:7px 9px;font-size:11px}.icon-button{height:34px;width:34px;font-size:17px}.header-actions{gap:7px}.sidebar{display:none}.app-body{display:block;min-height:calc(100dvh - 62px)}.demo-banner{font-size:8px;padding:7px 14px;min-height:29px}.main-content{padding:14px 12px 28px}.site-foot{padding:10px 15px 24px;font-size:8px}.bottom-nav{display:flex;left:0;right:0;bottom:0;width:100%;transform:none;max-width:none;background:#0d0c0ef5;border-top:1px solid #3b262f;padding:7px 4px calc(7px + env(safe-area-inset-bottom));z-index:50}.bottom-nav .nav-link{color:#9e959b;flex:1;max-width:none;min-width:0}.bottom-nav .nav-link.active{color:#e25270}.nav-link span{font-size:20px;line-height:22px}.nav-link small{font-size:9px;font-weight:650}.page{gap:15px}.dashboard-page{gap:11px}.f-hero{min-height:237px;padding:21px 18px}.hero-copy{max-width:78%}.hero-copy h1{font-size:32px}.hero-copy p{font-size:10px;line-height:1.7}.hero-frog{width:50%;right:-16%;top:20%;height:59%;opacity:.55}.hero-copy .micro-label{font-size:8px}.hero-actions .f-btn{min-height:34px;padding:9px 11px;font-size:10px}.dash-top,.dashboard-page .dash-top{grid-template-columns:1fr}.balance-panel,.profile-panel,.f-daily{min-height:0}.balance-big{margin:16px 0}.balance-big strong{font-size:36px}.dash-middle,.dash-bottom{grid-template-columns:1fr}.dash-bottom .actions-panel,.dashboard-page .profile-panel{grid-column:auto}.quick-actions-list{display:flex}.panel{padding:17px}.panel-heading{margin-bottom:13px}.daily-grid{gap:4px}.daily-day{padding:6px 1px;min-height:65px}.daily-day strong{font-size:8px}.daily-day small{font-size:8px}.achievement-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}.achievement-item{padding:9px 4px}.achievement-emblem{height:46px;width:46px;font-size:23px}.achievement-item b{font-size:9px}.achievement-item small{font-size:8px}.achievement-full{grid-template-columns:repeat(2,minmax(0,1fr))}.achievement-full .achievement-item{padding:15px 12px}.achievement-full .achievement-item b{font-size:11px}.f-gift-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.gift-visual{height:125px}.gift-visual>span{font-size:48px}.page-heading{padding:4px 0}.page-heading h1{font-size:30px}.page-heading p{font-size:12px}.f-stat-grid{gap:8px}.f-stat{padding:12px}.f-stat strong{font-size:21px}.f-stat small{font-size:8px}.market-showcase,.collection-overview,.mission-top{padding:20px;min-height:128px}.market-showcase h2,.collection-overview h2,.mission-top h2{font-size:24px}.market-showcase p,.collection-overview p,.mission-top p{font-size:11px}.large-collection-mark{width:85px}.info-rows{grid-template-columns:1fr;gap:9px}.info-rows>div{padding:10px}.task-row{gap:8px}.task-desc b{font-size:11px}.task-desc small{font-size:9px}.f-btn.tiny{font-size:10px;padding:6px 9px}.f-controls{flex-wrap:wrap}.f-controls select{width:100%}.f-banner{padding:15px}.filter-row{gap:6px}.filter-chip{padding:8px 11px}.f-error,.f-toast{margin:12px 12px 0}}
+@media(max-width:370px){.brand-text b{font-size:15px}.brand-mark{width:32px;height:32px}.hero-copy h1{font-size:27px}.hero-copy{max-width:84%}.daily-day strong{font-size:7px}.daily-day small{font-size:7px}.achievement-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.favorite-mini span{height:42px}.f-gift-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.gift-footer{flex-wrap:wrap}}
+
 </style></head><body><div id="app"></div><script>const NEWS_DATA=[{"id": "beta-01", "type": "update", "icon": "🚀", "title": "FROGI Arena 2.0", "text": "Каталог расширен, появились миссии, избранное и история активности.", "date": "2026-10-20"}, {"id": "beta-02", "type": "fairness", "icon": "🛡️", "title": "Важное об игре", "text": "Результат колеса выбирает сервер. В демоверсии FC не имеют денежной стоимости.", "date": "2026-10-20"}, {"id": "beta-03", "type": "tips", "icon": "💡", "title": "Совет коллекционеру", "text": "Фильтруй подарки по редкости и добавляй любимые в избранное.", "date": "2026-10-20"}];
 /* FROGI Arena • self-contained Vanilla JS application. No React / build required. */
 'use strict';
 const T = window.Telegram?.WebApp;
-try { T?.ready(); T?.expand(); T?.setHeaderColor?.('#0a0b10'); T?.setBackgroundColor?.('#090a0f'); } catch (_) {}
+try { T?.ready(); T?.expand(); T?.setHeaderColor?.('#080808'); T?.setBackgroundColor?.('#080808'); } catch (_) {}
 let D = null, SESSION = null, PAGE = 'home', BUSY = false, SPINNING = false;
 let ERROR = '', TOAST = '', TIMER = null, WHEEL_ANGLE = 0, LEADERS = [], FILTER = 'all', SORT = 'price', QUERY = '', ONLY_FAV = false;
 let MINES = null, PVP = null;
-const NAV = [['home','⌂','Главная'],['wheel','✦','Колесо'],['market','▣','Маркет'],['inventory','🎁','Подарки'],['profile','◉','Профиль']];
-const EXTRA = [['wallet','💰','Кошелёк'],['missions','🏆','Задания'],['leaderboard','🥇','Рейтинг'],['analytics','📈','Аналитика'],['mines','💣','Mines'],['pvp','⚔️','PvP'],['notifications','🔔','Уведомления'],['news','📰','Новости'],['support','💬','Поддержка'],['settings','⚙️','Настройки']];
+let MISSION_FILTER='all', ACH_FILTER='all', FAVORITE_TAB='all';
+const NAV = [['home','⌂','Главная'],['wheel','◎','Колесо'],['market','▦','Маркет'],['inventory','◇','Коллекция'],['profile','◉','Профиль']];
+const EXTRA = [['wallet','◈','Баланс'],['rewards','▤','Награды'],['missions','☑','Задания'],['achievements','♜','Достижения'],['promos','⌗','Промокоды'],['favorites','♡','Избранное'],['leaderboard','♛','Рейтинг'],['analytics','▥','Аналитика'],['mines','▧','Mines'],['pvp','⚔','PvP'],['notifications','♧','Уведомления'],['news','☷','Новости'],['support','◌','Поддержка'],['settings','⚙','Настройки']];
 const LABELS = Object.fromEntries([...NAV,...EXTRA].map(x=>[x[0],x[2]]));
 const ROOT = document.getElementById('app');
 const e = (str='') => String(str ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1562,48 +1722,77 @@ async function command(path,method='POST',body,success='',once=false){
 function go(page){ PAGE=LABELS[page]?page:'home'; if(PAGE==='leaderboard')loadLeaders(); location.hash=PAGE;render();scrollTo({top:0,behavior:'instant'}); }
 async function loadLeaders(){try{LEADERS=(await api('/api/leaderboard')).leaders||[];render()}catch(ex){ERROR=ex.message;render()}}
 function navButton([id,emoji,label]){return `<button class="nav-link ${PAGE===id?'active':''}" data-page="${id}"><span>${emoji}</span><small>${e(label)}</small></button>`;}
+const FROG_LOGO = `<svg class="frog-symbol" viewBox="0 0 106 73" fill="none" aria-hidden="true"><path d="M13 26C8 11 16 2 28 4c9 1 14 7 17 16 8-3 17-3 25 0 3-13 13-18 23-14 11 5 12 17 5 27 5 7 7 12 6 17L84 65l9-20c-30 11-48 13-76 1l10 21L3 50c-2-10 3-19 10-24Z" fill="#74162d"/><path d="M19 18c7-7 18-2 21 11-10-2-18-4-25-6 1-2 2-4 4-5Zm60-1c8-7 17-1 18 8l-24 5c0-6 2-10 6-13Z" fill="#0b090a"/><path d="M22 42c17 8 47 11 65-1-18 18-48 20-65 1Z" fill="#12090b"/></svg>`;
+const SIDE_LINKS = [['home','⌂','Главная'],['profile','♧','Профиль'],['missions','☑','Задания'],['rewards','▤','Награды'],['achievements','♜','Достижения'],['promos','⌗','Промокоды'],['favorites','♡','Избранное'],['market','▦','Маркет'],['wheel','◎','Колесо'],['inventory','◇','Коллекция']];
+function sideLink([id,symbol,label]){return `<button type="button" class="side-link ${PAGE===id?'active':''}" data-page="${id}"><span class="side-icon">${symbol}</span><span>${e(label)}</span>${id==='missions'&&D?.progress?.claimable?`<em>${D.progress.claimable}</em>`:''}</button>`;}
 function shell(inner){
  const u=D?.user||{};
- return `<div class="app-shell"><header class="topbar"><button type="button" class="brand brand-button" data-page="home"><div class="brand-mark">F<span>R</span></div><div><div class="brand-name">FROGI<span>®</span></div><div class="brand-sub">COLLECT · PLAY · EXPLORE</div></div></button><div class="header-actions">${D?`<button class="balance-pill" data-page="wallet">◈ <b>${fmt(u.balance)}</b><span> FC</span></button>`:''}<button class="icon-button notification-shortcut" data-page="notifications">♧${D?.unreadCount?`<i>${D.unreadCount>9?'9+':D.unreadCount}</i>`:''}</button><button class="icon-button header-menu" data-page="menu">☰</button></div></header>
- <div class="demo-banner">◉ DEMO MODE · Виртуальные FC и подарки, без реальных денег и вывода</div>
+ return `<div class="app-shell"><header class="topbar"><button type="button" class="brand brand-button" data-page="home"><span class="brand-mark">${FROG_LOGO}</span><span class="brand-text"><b>FROGI</b><small>ARENA</small></span></button>
+ <nav class="desktop-tabs" aria-label="Быстрый переход">${[['home','Главная'],['missions','Задания'],['rewards','Награды'],['achievements','Достижения'],['market','Маркет']].map(([id,title])=>`<button data-page="${id}" class="${PAGE===id?'active':''}">${title}</button>`).join('')}</nav>
+ <div class="header-actions">${D?`<button class="balance-pill" data-page="wallet"><span>◈</span><b>${fmt(u.balance)}</b><small>FC</small></button>`:''}
+ <button class="icon-button notification-shortcut" aria-label="Уведомления" data-page="notifications">♧${D?.unreadCount?`<i>${D.unreadCount>9?'9+':D.unreadCount}</i>`:''}</button><button class="user-chip" data-page="profile"><span class="tiny-frog">${FROG_LOGO}</span><span><b>${e(u.username?'@'+u.username:u.firstName||'FROGI Player')}</b><small>Level ${D?.progress?.level?.level||1}</small></span><span class="chip-arrow">⌄</span></button></div></header>
+ <div class="app-body"><aside class="sidebar"><nav aria-label="Все разделы">${SIDE_LINKS.map(sideLink).join('')}</nav><div class="sidebar-bottom"><b>FROGI <span>ARENA</span></b><p>Собирай коллекцию, выполняй задания и развивай свой профиль.</p><button data-page="menu">Все разделы ↗</button></div><div class="side-secondary">${[['leaderboard','Рейтинг'],['analytics','Аналитика'],['settings','Настройки'],['support','Поддержка']].map(([id,label])=>`<button data-page="${id}">${label} ↗</button>`).join('')}</div></aside>
+ <div class="content-column"><div class="demo-banner"><span class="mini-pulse"></span> DEMO / Виртуальные FC без денежной стоимости, вывода и реальных ставок</div>
  ${ERROR?`<div class="f-error" role="alert">⚠ ${e(ERROR)} <button data-action="clear-error">×</button></div>`:''}
  ${TOAST?`<div class="f-toast" role="status">✓ ${e(TOAST)} <button data-action="clear-toast">×</button></div>`:''}
- <main class="main-content" id="main-content">${inner}</main>
+ <main class="main-content" id="main-content">${inner}</main><footer class="site-foot"><span>© FROGI ARENA · 2026</span><span>PLAY · COLLECT · PROGRESS</span></footer></div></div>
  <nav class="bottom-nav" aria-label="Основная навигация">${NAV.map(navButton).join('')}</nav></div>`;
 }
-function giftCard(g,buyMode=true){return `<article class="f-gift rarity-${e(g.rarity).toLowerCase()}"><div class="gift-visual"><span>${e(g.emoji)}</span><div class="gift-glow"></div></div><div class="gift-body">${tag(g.rarity,'r-'+g.rarity.toLowerCase())}<h3>${e(g.title)}</h3><p>${e(g.description)}</p><div class="gift-footer"><strong>${money(g.price)}</strong>${buyMode?btn('Купить','buy','tiny',BUSY||D.user.balance<g.price,`data-id="${e(g.id)}"`):btn(g.favorite?'♥':'♡','favorite','tiny',BUSY,`data-id="${e(g.inventoryId)}" data-favorite="${g.favorite?'1':'0'}"`)}</div></div></article>`;}
+function giftCard(g,buyMode=true){let wanted=Boolean(g.wishlisted),own=Boolean(g.favorite);return `<article class="f-gift rarity-${e(g.rarity).toLowerCase()}"><div class="gift-visual"><span>${e(g.emoji)}</span><div class="gift-glow"></div><button class="wishlist-heart ${buyMode&&wanted||!buyMode&&own?'selected':''}" aria-label="${buyMode?'Добавить в список желаний':'Избранное'}" data-action="${buyMode?'wishlist':'favorite'}" data-id="${e(buyMode?g.id:g.inventoryId)}" data-favorite="${buyMode?wanted?'1':'0':own?'1':'0'}">${(buyMode?wanted:own)?'♥':'♡'}</button></div><div class="gift-body">${tag(g.rarity,'r-'+g.rarity.toLowerCase())}<h3>${e(g.title)}</h3><p>${e(g.description)}</p><div class="gift-footer"><strong>${money(g.price)}</strong>${buyMode?btn('Купить ↗','buy','tiny',BUSY||D.user.balance<g.price,`data-id="${e(g.id)}"`):`<span class="f-muted">В коллекции</span>`}</div></div></article>`;}
 function quickActions(){let items=[['wheel','🎡','Колесо'],['market','🛍️','Маркет'],['inventory','🎁','Коллекция'],['missions','🏆','Миссии'],['leaderboard','🥇','Рейтинг'],['analytics','📈','Аналитика']];return `<div class="quick-grid">${items.map(([id,emoji,label])=>`<button class="quick-tile" data-page="${id}"><span>${emoji}</span><strong>${label}</strong><span class="arrow">↗</span></button>`).join('')}</div>`;}
-function dailyCard(){let claimed=D.daily.claimed;return `<section class="f-daily"><div class="daily-pic">📅<small>+${D.daily.reward}</small></div><div class="daily-info"><span class="micro-label">DAILY DROP · ${e(date(D.daily.today))}</span><h3>${claimed?'Награда получена':'Ежедневный бонус'}</h3><p>${claimed?'Возвращайся завтра за новым бонусом.':'Каждый день тестовые FC — бесплатно.'}</p></div>${btn(claimed?'✓':'→','daily','daily-btn',claimed||BUSY)}</section>`;}
-function home(){let s=D.progress.stats; let collection=D.inventory;return `<div class="page enter">${`<section class="f-hero"><div class="f-hero-deco">🐸</div><div class="f-hero-content"><span class="micro-label"><i class="live-dot"></i> FROGI ARENA / SEASON 01</span><h1>ТВОЯ АРЕНА.<br><span>ТВОИ ПРАВИЛА.</span></h1><p>Собирай цифровые подарки, открывай достижения и поднимайся в рейтинге.</p><div class="hero-actions">${btn('✦ Играть','go-wheel','primary')} ${btn('Маркет ↗','go-market','outline')}</div></div></section>`}
- <div class="f-stat-grid"><div class="f-stat"><small>БАЛАНС</small><strong>${money(D.user.balance)}</strong><span>Виртуальные кредиты</span></div><div class="f-stat"><small>КОЛЛЕКЦИЯ</small><strong>${fmt(collection.length)}</strong><span>Цифровых подарков</span></div><div class="f-stat"><small>УРОВЕНЬ</small><strong>${fmt(D.progress.level.level)}</strong><span>${D.progress.level.progressPercent}% до следующего</span></div></div>
- ${dailyCard()} ${section('Открой мир FROGI','РАЗДЕЛЫ')} ${quickActions()}
- ${section('Популярные предметы','МАРКЕТ · ДЕМО')}<div class="f-gift-grid">${D.gifts.slice(0,4).map(g=>giftCard(g)).join('')}</div>
- <div class="f-banner"><span>🎡</span><div><h3>Испытай удачу</h3><p>Сервер случайно выбирает приз. В каждом раунде — виртуальный подарок.</p></div>${btn('Вращать','go-wheel','tiny')}</div></div>`;}
+function dailyStrip(){let d=D.daily;return `<div class="daily-grid">${d.schedule.map((amount,i)=>{let reached=d.claimed?i<d.dayIndex:i<d.dayIndex-1;let active=i===d.dayIndex-1;return `<div class="daily-day ${active?'selected':''} ${reached?'received':''}"><span class="daily-icon">${reached?'✓':active?'◇':'✦'}</span><strong>День ${i+1}</strong><small>+${amount} FC</small></div>`;}).join('')}</div>`;}
+function dailyCard(){let d=D.daily;return `<section class="f-daily panel"><div class="panel-heading"><div><span class="panel-symbol">▤</span><h3>Ежедневные награды</h3></div><span class="small-muted">День ${d.dayIndex} / 7</span></div>${dailyStrip()}<div class="daily-bottom">${btn(d.claimed?'✓ Получено сегодня':`Забрать +${d.reward} FC`,'daily','primary wide',d.claimed||BUSY)}<small>${d.claimed?'Следующая награда завтра (UTC)':`Серия: ${d.streak} дн. · обновление 00:00 UTC`}</small></div></section>`;}
+function taskList(limit=99){let tasks=D.progress.missions.slice(0,limit);return `<div class="tasks-list">${tasks.map(m=>`<div class="task-row"><span class="task-icon">${e(m.icon)}</span><div class="task-desc"><b>${e(m.title)}</b><small>${e(m.description)} · +${m.reward} FC</small><div class="progress-track tiny-progress"><i style="width:${Math.min(100,m.current/m.target*100)}%"></i></div></div>${m.claimed?`<span class="task-complete">✓ Получено</span>`:m.completed?btn('Забрать','mission-claim','tiny',BUSY,`data-id="${e(m.id)}"`):`<span class="task-count">${m.current}/${m.target}</span>`}</div>`).join('')}</div>`;}
+function achievementGrid(limit=99){let aa=D.progress.achievements.slice(0,limit);return `<div class="achievement-grid">${aa.map(a=>`<div class="achievement-item ${a.unlocked?'unlocked':''}"><div class="achievement-emblem">${e(a.icon)}</div><b>${e(a.title)}</b><small>${a.current}/${a.threshold} · +${a.reward} FC</small>${a.claimed?`<span class="achievement-state">✓ Получено</span>`:a.unlocked?btn('Забрать','achievement-claim','mini',BUSY,`data-id="${e(a.id)}"`):`<span class="achievement-locked">Закрыто</span>`}</div>`).join('')}</div>`;}
+function promoBlock(){return `<div class="promo-area"><p class="f-muted">Есть промокод? Активируй и получи виртуальные FC на баланс.</p><div class="promo-form"><input class="f-input" id="promo" aria-label="Промокод" maxlength="40" placeholder="Введи промокод">${btn('Активировать','promo','primary',BUSY)}</div><small>Один промокод можно активировать один раз.</small></div>`;}
+function sectionHead(title,page='',note=''){return `<div class="panel-heading"><div><span class="panel-symbol">${title.includes('остижен')?'♜':title.includes('збран')?'♡':title.includes('адан')?'☑':'◈'}</span><h3>${e(title)}</h3></div>${page?`<button class="text-link" data-page="${page}">${e(note||'Смотреть все')} ↗</button>`:''}</div>`;}
+function home(){let p=D.progress, u=D.user, fav=D.inventory.filter(x=>x.favorite);let wish=D.gifts.filter(x=>x.wishlisted);return `<div class="page enter dashboard-page">
+ <section class="f-hero"><div class="hero-copy"><span class="micro-label">F R O G I &nbsp; A R E N A &nbsp; / &nbsp; SEASON 01</span><h1>Играй. Собирай.<br><span>Побеждай.</span></h1><p>Выполняй задания, получай ежедневные награды и собирай уникальную коллекцию FROGI.</p><div class="hero-actions">${btn('Начать игру ↗','go-wheel','primary')} ${btn('Изучить маркет','go-market','outline')}</div></div><div class="hero-frog" aria-hidden="true">${FROG_LOGO}</div><span class="hero-caption">COLLECT MORE<br>PLAY MORE</span></section>
+ <div class="dash-top"><section class="panel balance-panel">${sectionHead('Твой баланс','wallet','История')}<div class="balance-big"><span class="balance-avatar">${FROG_LOGO}</span><div><strong>${fmt(u.balance)}</strong> <span>FC</span><small>Виртуальные кредиты</small></div></div><div class="balance-actions">${btn('Моя коллекция','go-inventory','outline')} ${btn('Маркет ↗','go-market','primary')}</div></section>
+ ${dailyCard()}
+ <section class="panel profile-panel">${sectionHead('Твой профиль','profile','Открыть')}<div class="profile-row"><span class="profile-badge">${FROG_LOGO}</span><div><b>${e(u.username?'@'+u.username:u.firstName)}</b><small>FROGI HOLDER</small><span class="level-badge">Level ${p.level.level}</span></div></div><div class="xp-label"><span>Опыт коллекционера</span><b>${p.level.currentXp} / ${p.level.requiredXp} XP</b></div><div class="progress-track"><i style="width:${p.level.progressPercent}%"></i></div></section></div>
+ <div class="dash-middle"><section class="panel achievement-panel">${sectionHead('Достижения','achievements')} ${achievementGrid(4)}</section><section class="panel tasks-panel">${sectionHead('Активные задания','missions')} ${taskList(3)}</section></div>
+ <div class="dash-bottom"><section class="panel promo-panel">${sectionHead('Промокоды','promos','История')} ${promoBlock()}</section><section class="panel favorites-panel">${sectionHead('Избранное','favorites','Управлять')}<div class="favorite-previews">${[...fav,...wish].slice(0,3).map(g=>`<button data-page="favorites" class="favorite-mini"><span>${e(g.emoji)}</span><b>${e(g.title)}</b><small>${e(g.rarity)}</small></button>`).join('')||`<div class="empty-mini">♡<small>Пока нет избранного — отметь товары сердцем.</small></div>`}</div></section><section class="panel actions-panel">${sectionHead('Быстрые действия')}<div class="quick-actions-list">${[['wheel','◎','Колесо','Виртуальные призы'],['market','▦','Маркет','Коллекционные предметы'],['leaderboard','♛','Рейтинг','Топ игроков']].map(([id,i,t,desc])=>`<button data-page="${id}"><span>${i}</span><b>${t}<small>${desc}</small></b><em>↗</em></button>`).join('')}</div></section></div>
+ </div>`;}
 function wheel(){let total=D.probabilities.reduce((a,v)=>a+v.weight,0);let entries=D.probabilities.map((p,i)=>({p,g:D.gifts.find(g=>g.id===p.giftId),i}));return `<div class="page enter">${crumb('Колесо удачи','Каждое вращение приносит один коллекционный предмет.')}
  <div class="wheel-view"><div class="wheel-decor">✦ FAIR PLAY ✦</div><div class="wheel-arena"><div class="wheel-pointer">▼</div><div class="wheel-face ${SPINNING?'wheel-spinning':''}" id="wheel-face" style="transform:rotate(${WHEEL_ANGLE}deg)"><div class="wheel-labels">${entries.map(({g,i})=>`<span style="transform:rotate(${i*90+45}deg) translateY(-105px) rotate(${-i*90-45}deg)">${e(g?.emoji||'🎁')}</span>`).join('')}</div></div><div class="wheel-center">FR</div></div>
  <div class="wheel-bottom"><span class="micro-label">ЦЕНА РАУНДА</span><h2>${money(D.spinCost)}</h2>${btn(SPINNING?'Крутим колесо...':'🎡 Вращать колесо','spin','primary huge',BUSY||SPINNING||D.user.balance<D.spinCost)}<p>Только демо-валюта. В каждом раунде выдаётся виртуальный подарок.</p></div></div>
  ${section('Шансы выпадения','ПРОВЕРЯЕМЫЕ ВЕРОЯТНОСТИ')}<div class="prob-list">${entries.map(({p,g})=>`<div><span>${e(g?.emoji)} <b>${e(g?.title)}</b></span><span>${tag(g?.rarity||'','r-'+String(g?.rarity||'').toLowerCase())} <strong>${p.probabilityPercent}%</strong></span></div>`).join('')}</div>
  ${section('Последние вращения',`${D.spins.length} ЗАПИСЕЙ`)}<div class="f-list">${D.spins.slice(0,6).map(s=>`<div class="list-item"><span class="list-emoji">${e(s.emoji)}</span><div><b>${e(s.title)}</b><small>${e(date(s.createdAt))}</small></div><span class="negative">-${fmt(s.cost)} FC</span></div>`).join('')||empty('🎡','Ещё нет вращений','Попробуй колесо!')}</div></div>`;}
-function market(){let all=D.gifts.filter(g=>(FILTER==='all'||g.rarity===FILTER)&&(g.title+' '+g.description).toLowerCase().includes(QUERY.toLowerCase()));all.sort((a,b)=>SORT==='expensive'?b.price-a.price:SORT==='name'?a.title.localeCompare(b.title):a.price-b.price);return `<div class="page enter">${crumb('Маркет подарков','Виртуальные предметы для твоей коллекции.')}
- <div class="f-banner market-banner"><span>🛍️</span><div><h3>FROGI MARKET</h3><p>${D.gifts.length} уникальных предметов · реальные платежи не используются</p></div></div>
- <div class="f-controls"><input id="search" class="f-input" type="search" placeholder="Поиск предметов..." value="${e(QUERY)}" maxlength="60"><select id="sort" class="f-input"><option value="price" ${SORT==='price'?'selected':''}>Сначала доступные</option><option value="expensive" ${SORT==='expensive'?'selected':''}>Сначала дорогие</option><option value="name" ${SORT==='name'?'selected':''}>По названию</option></select></div>
+function market(){let all=D.gifts.filter(g=>(FILTER==='all'||g.rarity===FILTER)&&(g.title+' '+g.description).toLowerCase().includes(QUERY.toLowerCase()));all.sort((a,b)=>SORT==='expensive'?b.price-a.price:SORT==='name'?a.title.localeCompare(b.title):a.price-b.price);return `<div class="page enter">${crumb('Маркет','Подбирай коллекционные предметы и сохраняй понравившиеся в избранное.')}
+ <div class="market-showcase"><span>FROGI / MARKET</span><h2>Твоя коллекция начинается здесь.</h2><p>${D.gifts.length} предметов разных категорий. Все операции — только с виртуальными FC.</p></div>
+ <div class="f-controls"><input id="search" class="f-input" type="search" placeholder="Поиск предметов..." value="${e(QUERY)}" maxlength="60"><select id="sort" class="f-input"><option value="price" ${SORT==='price'?'selected':''}>Цена ↑</option><option value="expensive" ${SORT==='expensive'?'selected':''}>Цена ↓</option><option value="name" ${SORT==='name'?'selected':''}>Название</option></select></div>
  <div class="filter-row">${[['all','Все'],['Common','Common'],['Rare','Rare'],['Epic','Epic'],['Legendary','Legendary']].map(([id,label])=>`<button class="filter-chip ${FILTER===id?'selected':''}" data-filter="${id}">${label}</button>`).join('')}</div>
- ${section('Каталог',`${all.length} ПРЕДМЕТОВ`)}${all.length?`<div class="f-gift-grid">${all.map(g=>giftCard(g)).join('')}</div>`:empty('🔎','Ничего не найдено','Измени фильтры или строку поиска.','reset-filters','Сбросить фильтры')}</div>`;}
-function inventory(){let items=D.inventory.filter(g=>(FILTER==='all'||g.rarity===FILTER)&&(!ONLY_FAV||g.favorite)&&(g.title.toLowerCase().includes(QUERY.toLowerCase())));return `<div class="page enter">${crumb('Моя коллекция','Каждая находка хранится в твоём инвентаре.')}
- <div class="f-banner"><span>🎁</span><div><h3>Твои сокровища</h3><p>${D.inventory.length} предметов · ${D.inventory.filter(g=>g.favorite).length} в избранном</p></div></div>
- <div class="f-controls"><input id="search" class="f-input" type="search" placeholder="Поиск в коллекции..." value="${e(QUERY)}"><button class="filter-chip ${ONLY_FAV?'selected':''}" data-action="toggle-favs">♥ Избранное</button></div>
+ ${section('Каталог',`${all.length} ПРЕДМЕТОВ`)}${all.length?`<div class="f-gift-grid">${all.map(g=>giftCard(g)).join('')}</div>`:empty('⌕','Ничего не найдено','Попробуй другие фильтры.','reset-filters','Сбросить фильтры')}</div>`;}
+function inventory(){let items=D.inventory.filter(g=>(FILTER==='all'||g.rarity===FILTER)&&(!ONLY_FAV||g.favorite)&&(g.title.toLowerCase().includes(QUERY.toLowerCase())));return `<div class="page enter">${crumb('Коллекция','Здесь хранятся все приобретённые и выигранные предметы.')}
+ <div class="collection-overview"><div><span>COLLECTION / INVENTORY</span><h2>${D.inventory.length} <small>предметов</small></h2><p>${D.inventory.filter(g=>g.favorite).length} сохранено в избранном · ${D.progress.stats.uniqueGifts} уникальных</p></div><span class="large-collection-mark">${FROG_LOGO}</span></div>
+ <div class="f-controls"><input id="search" class="f-input" type="search" placeholder="Поиск в коллекции..." value="${e(QUERY)}"><button class="filter-chip ${ONLY_FAV?'selected':''}" data-action="toggle-favs">♡ Избранные</button></div>
  <div class="filter-row">${[['all','Все'],['Common','Common'],['Rare','Rare'],['Epic','Epic'],['Legendary','Legendary']].map(([id,label])=>`<button class="filter-chip ${FILTER===id?'selected':''}" data-filter="${id}">${label}</button>`).join('')}</div>
- ${items.length?`<div class="f-gift-grid">${items.map(g=>giftCard(g,false)).join('')}</div>`:empty('🎁','Здесь пока пусто','Получи подарок в колесе или купи в маркете.','go-market','В маркет')}</div>`;}
-function profile(){let u=D.user,p=D.progress,stats=p.stats;return `<div class="page enter">${crumb('Личный кабинет','Твои достижения, прогресс и настройки.')}
- <div class="profile-hero"><div class="profile-avatar">🐸</div><div><span class="micro-label">COLLECTOR PROFILE</span><h2>${e(u.username?'@'+u.username:u.firstName)}</h2><p>Игрок FROGI с ${e(date(u.createdAt))}</p>${tag(`Уровень ${p.level.level}`,'level')}</div></div>
- <div class="f-stat-grid"><div class="f-stat"><small>ОЧКИ</small><strong>${fmt(stats.totalScore)}</strong><span>PTS</span></div><div class="f-stat"><small>ВРАЩЕНИЯ</small><strong>${fmt(stats.spins)}</strong><span>Всего</span></div><div class="f-stat"><small>ДОСТИЖЕНИЯ</small><strong>${p.unlockedCount}/${p.achievements.length}</strong><span>Открыто</span></div></div>
- <div class="f-box"><div class="f-between"><b>✨ Опыт коллекционера</b><span>${p.level.currentXp} / ${p.level.requiredXp} XP</span></div><div class="progress-track"><i style="width:${p.level.progressPercent}%"></i></div></div>
- ${section('Активировать промокод')}<div class="f-box"><div class="f-controls"><input id="promo" class="f-input" placeholder="Введите промокод" maxlength="40">${btn('Активировать','promo','primary',BUSY)}</div><p class="f-muted">Промокоды используются один раз на аккаунт.</p></div>
- ${section('Разделы аккаунта')}<div class="tile-grid">${EXTRA.filter(x=>!['mines','pvp','news'].includes(x[0])).map(([id,pic,t])=>`<button class="f-tile" data-page="${id}"><span>${pic}</span><b>${t}</b><small>↗</small></button>`).join('')}</div></div>`;}
-function missions(){let p=D.progress;return `<div class="page enter">${crumb('Задания и награды','Развивай свой аккаунт и собирай достижения.')}${dailyCard()}
- <div class="f-box"><div class="f-between"><h3>⭐ Уровень ${p.level.level}</h3><strong>${p.level.progressPercent}%</strong></div><div class="progress-track"><i style="width:${p.level.progressPercent}%"></i></div><p class="f-muted">${p.level.currentXp} / ${p.level.requiredXp} XP</p></div>
- ${section('Миссии',`${p.completedMissions} / ${p.missions.length}`)}<div class="mission-list">${p.missions.map(m=>`<div class="f-mission"><span class="mission-pic">${e(m.icon)}</span><div><b>${e(m.title)}</b><small>${e(m.description)}</small><div class="progress-track"><i style="width:${m.current/m.target*100}%"></i></div><small>${m.current} / ${m.target}</small></div><span class="mission-check">${m.completed?'✓':Math.round(m.current/m.target*100)+'%'}</span></div>`).join('')}</div>
- ${section('Достижения',`${p.unlockedCount} / ${p.achievements.length}`)}<div class="ach-grid">${p.achievements.map(a=>`<div class="ach ${a.unlocked?'complete':''}"><span>${a.unlocked?e(a.icon):'🔒'}</span><b>${e(a.title)}</b><small>${e(a.details)}</small><em>${a.unlocked?'✓ Получено':a.current+'/'+a.threshold}</em></div>`).join('')}</div></div>`;}
+ ${items.length?`<div class="f-gift-grid">${items.map(g=>giftCard(g,false)).join('')}</div>`:empty('◇','Пока пусто','Купи предмет или получи награду в колесе.','go-market','Открыть маркет')}</div>`;}
+function profile(){let u=D.user,p=D.progress,s=p.stats;return `<div class="page enter">${crumb('Профиль','Твои результаты, прогресс и информация об аккаунте.')}
+ <div class="profile-hero"><div class="profile-avatar">${FROG_LOGO}</div><div><span class="micro-label">FROGI / MEMBER</span><h2>${e(u.username?'@'+u.username:u.firstName)}</h2><p>Игрок с ${e(date(u.createdAt))}</p>${tag(`Level ${p.level.level}`,'level')}</div></div>
+ <div class="f-stat-grid"><div class="f-stat"><small>РЕЙТИНГ / XP</small><strong>${fmt(s.totalScore)}</strong><span>Очки</span></div><div class="f-stat"><small>ПРЕДМЕТЫ</small><strong>${fmt(s.collection)}</strong><span>Коллекция</span></div><div class="f-stat"><small>ДОСТИЖЕНИЯ</small><strong>${p.unlockedCount}/${p.achievements.length}</strong><span>Открыто</span></div></div>
+ <div class="panel profile-progress">${sectionHead('Прогресс уровня')}<div class="xp-label"><span>Уровень ${p.level.level}</span><b>${p.level.currentXp} / ${p.level.requiredXp} XP</b></div><div class="progress-track"><i style="width:${p.level.progressPercent}%"></i></div></div>
+ ${section('Управление аккаунтом')}<div class="tile-grid">${EXTRA.filter(x=>!['mines','pvp','news'].includes(x[0])).map(([id,pic,t])=>`<button class="f-tile" data-page="${id}"><span>${pic}</span><b>${t}</b><small>↗</small></button>`).join('')}</div></div>`;}
+function missions(){let p=D.progress;let ms=p.missions.filter(x=>MISSION_FILTER==='all'||MISSION_FILTER==='ready'&&x.completed&&!x.claimed||MISSION_FILTER==='pending'&&!x.completed||MISSION_FILTER==='claimed'&&x.claimed);return `<div class="page enter">${crumb('Задания','Выполняй цели и забирай награды прямо на баланс.')}
+ <div class="mission-top panel"><div><span class="micro-label">MISSIONS / PROGRESS</span><h2>${p.completedMissions} <small>/ ${p.missions.length}</small></h2><p>Заданий выполнено · ${p.claimable} наград доступно</p></div><span class="mission-top-icon">☑</span></div>
+ <div class="filter-row">${[['all','Все'],['ready','Забрать'],['pending','В процессе'],['claimed','Получено']].map(([id,label])=>`<button class="filter-chip ${MISSION_FILTER===id?'selected':''}" data-mission-filter="${id}">${label}</button>`).join('')}</div>
+ <div class="panel page-panel">${sectionHead('Список заданий')}<div class="tasks-list">${ms.map(m=>`<div class="task-row"><span class="task-icon">${e(m.icon)}</span><div class="task-desc"><b>${e(m.title)}</b><small>${e(m.description)} · +${m.reward} FC</small><div class="progress-track tiny-progress"><i style="width:${Math.min(100,m.current/m.target*100)}%"></i></div></div>${m.claimed?`<span class="task-complete">✓ Получено</span>`:m.completed?btn('Забрать','mission-claim','tiny',BUSY,`data-id="${e(m.id)}"`):`<span class="task-count">${m.current}/${m.target}</span>`}</div>`).join('')||empty('☑','Нет заданий','Выбери другой фильтр.')}</div></div></div>`;}
+function rewards(){return `<div class="page enter">${crumb('Ежедневные награды','Забирай FC каждый день, чтобы поддерживать серию.')}
+ ${dailyCard()}<div class="panel page-panel">${sectionHead('Как это работает')}<div class="info-rows"><div><b>01 / Ежедневный вход</b><p>Одно начисление за календарный день по UTC.</p></div><div><b>02 / Серия наград</b><p>Если вернуться на следующий день, награда увеличивается вплоть до 7-го дня.</p></div><div><b>03 / Новый цикл</b><p>После 7-го дня серия повторяется. Пропущенный день сбрасывает серию.</p></div></div></div></div>`;}
+function achievements(){let p=D.progress;let aa=p.achievements.filter(a=>ACH_FILTER==='all'||ACH_FILTER==='ready'&&a.unlocked&&!a.claimed||ACH_FILTER==='locked'&&!a.unlocked||ACH_FILTER==='claimed'&&a.claimed);return `<div class="page enter">${crumb('Достижения','Разблокируй значки и получай дополнительные FC.')}
+ <div class="mission-top panel"><div><span class="micro-label">ACHIEVEMENTS / COLLECTION</span><h2>${p.unlockedCount} <small>/ ${p.achievements.length}</small></h2><p>Достижений открыто</p></div><span class="mission-top-icon">♜</span></div>
+ <div class="filter-row">${[['all','Все'],['ready','Забрать'],['locked','Закрытые'],['claimed','Получены']].map(([id,label])=>`<button class="filter-chip ${ACH_FILTER===id?'selected':''}" data-ach-filter="${id}">${label}</button>`).join('')}</div>
+ <div class="achievement-grid achievement-full">${aa.map(a=>`<div class="achievement-item ${a.unlocked?'unlocked':''}"><div class="achievement-emblem">${e(a.icon)}</div><b>${e(a.title)}</b><p>${e(a.details)}</p><small>${a.current}/${a.threshold} · +${a.reward} FC</small>${a.claimed?`<span class="achievement-state">✓ Получено</span>`:a.unlocked?btn('Забрать','achievement-claim','mini',BUSY,`data-id="${e(a.id)}"`):`<span class="achievement-locked">Закрыто</span>`}</div>`).join('')}</div></div>`;}
+function promos(){let history=D.promoHistory||[];return `<div class="page enter">${crumb('Промокоды','Активируй уникальные коды и получай бонусные FC.')}
+ <div class="panel page-panel">${sectionHead('Активация промокода')}${promoBlock()}</div>
+ <div class="panel page-panel">${sectionHead('История активаций')}<div class="f-list">${history.map(h=>`<div class="list-item"><span class="list-emoji">⌗</span><div><b>${e(h.code)}</b><small>${date(h.createdAt)}</small></div><strong class="positive">+${fmt(h.amount)} FC</strong></div>`).join('')||empty('⌗','Промокоды ещё не использованы','Введи действующий код выше.')}</div></div></div>`;}
+function favorites(){let owned=D.inventory.filter(g=>g.favorite);let wanted=D.gifts.filter(g=>g.wishlisted);return `<div class="page enter">${crumb('Избранное','Сохраняй понравившиеся предметы, чтобы не потерять их.')}
+ <div class="f-stat-grid"><div class="f-stat"><small>В МОЕЙ КОЛЛЕКЦИИ</small><strong>${owned.length}</strong><span>Предметов</span></div><div class="f-stat"><small>СПИСОК ЖЕЛАНИЙ</small><strong>${wanted.length}</strong><span>Хочу приобрести</span></div></div>
+ <div class="filter-row">${[['all','Все'],['owned','В коллекции'],['wanted','Список желаний']].map(([id,label])=>`<button class="filter-chip ${FAVORITE_TAB===id?'selected':''}" data-fav-tab="${id}">${label}</button>`).join('')}</div>
+ ${(FAVORITE_TAB==='all'||FAVORITE_TAB==='owned')&&owned.length?`${section('В коллекции')}<div class="f-gift-grid">${owned.map(g=>giftCard(g,false)).join('')}</div>`:''}
+ ${(FAVORITE_TAB==='all'||FAVORITE_TAB==='wanted')&&wanted.length?`${section('Список желаний')}<div class="f-gift-grid">${wanted.map(g=>giftCard(g)).join('')}</div>`:''}
+ ${!(FAVORITE_TAB==='owned'?owned.length:FAVORITE_TAB==='wanted'?wanted.length:owned.length+wanted.length)?empty('♡','Избранное пусто','Открой маркет или коллекцию и нажми на сердечко.','go-market','В маркет'):''}</div>`;}
 function leaderboard(){return `<div class="page enter">${crumb('Рейтинг игроков','Лучшие коллекционеры арены.')}
  <div class="f-banner"><span>🏆</span><div><h3>Зал славы FROGI</h3><p>Баллы начисляются за коллекцию, вращения, покупки и ежедневные бонусы.</p></div></div>
  ${section('Топ игроков',`${LEADERS.length} УЧАСТНИКОВ`)}<div class="f-list">${LEADERS.map(l=>`<div class="list-item ${l.id===D.user.id?'my-rank':''}"><b class="rank">${l.rank<=3?['🥇','🥈','🥉'][l.rank-1]:'#'+l.rank}</b><span class="list-emoji">🐸</span><div><b>${e(l.name)}${l.id===D.user.id?' (ты)':''}</b><small>${l.items} предметов · ${l.spins} вращений</small></div><strong>${fmt(l.score)} PTS</strong></div>`).join('')||empty('🏆','Пока никого','Стань первым в рейтинге!')}</div></div>`;}
@@ -1631,13 +1820,13 @@ function mines(){if(!MINES)initMines();return `<div class="page enter">${crumb('
 function pvp(){return `<div class="page enter">${crumb('PvP — тренировочный режим','Пример дуэли. Реальный мультиплеер не подключён.')}
  <div class="f-banner"><span>⚔️</span><div><h3>FROGI DUEL</h3><p>Выбери сторону и сыграй против случайного виртуального соперника.</p></div></div>
  <div class="duel"><div class="duel-team"><span>🐸</span><b>ТЫ</b></div><div class="duel-vs">VS</div><div class="duel-team"><span>🤖</span><b>БОТ</b></div></div><div class="f-box"><h3>Выбери сторону монеты</h3><div class="hero-actions">${btn('☀ Орёл','pvp-head','primary')} ${btn('🌙 Решка','pvp-tail','outline')}</div>${PVP?`<div class="game-result">${e(PVP)}</div>`:''}<p class="f-muted">Это демонстрация интерфейса, ставки FC не принимаются.</p></div></div>`;}
-function directory(){return `<div class="page enter">${crumb('Все разделы','Выбирай занятие в мире FROGI.')}
- <div class="tile-grid">${[...NAV,...EXTRA].map(([id,pic,t])=>`<button class="f-tile" data-page="${id}"><span>${pic}</span><b>${t}</b><small>↗</small></button>`).join('')}</div><p class="f-muted">FROGI Arena 2.2 · Python all-in-one · демоверсия</p></div>`;}
+function directory(){return `<div class="page enter">${crumb('Все разделы','Выбирай раздел FROGI Arena.')}
+ <div class="tile-grid">${[...NAV,...EXTRA].map(([id,pic,t])=>`<button class="f-tile" data-page="${id}"><span>${pic}</span><b>${t}</b><small>↗</small></button>`).join('')}</div><p class="f-muted">FROGI Arena 3.0 · One-file Python · demo</p></div>`;}
 function render(){
  document.documentElement.classList.toggle('reduce-motion',Boolean(D?.settings?.reduceMotion));
  let body='';
  if(!D){body=`<div class="startup-view"><div class="startup-orbit">🐸</div><h1>FROGI ARENA</h1><p>${ERROR?e(ERROR):'Вход через Telegram Mini App...'}</p>${btn('↻ Повторить вход','retry','primary')}</div>`;}
- else {let page={home,wheel,market,inventory,profile,missions,leaderboard,wallet,analytics,notifications:notes,news,support,settings,mines,pvp,menu:directory}[PAGE]||home;body=page();}
+ else {let page={home,wheel,market,inventory,profile,missions,rewards,achievements,promos,favorites,leaderboard,wallet,analytics,notifications:notes,news,support,settings,mines,pvp,menu:directory}[PAGE]||home;body=page();}
  ROOT.innerHTML=shell(body);
 }
 function sound(){if(!D?.settings?.sound)return;try{const ctx=new(window.AudioContext||window.webkitAudioContext)();let o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';o.frequency.value=740;g.gain.value=.028;o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+.085);o.onended=()=>ctx.close()}catch(_){}}
@@ -1661,6 +1850,9 @@ async function actions(action,el){
  if(action==='daily'){await command('/api/daily/claim','POST',{},r=>`+${r.reward} FC · ежедневный бонус!`);return;}
  if(action==='buy'){let gift=D.gifts.find(g=>g.id===el.dataset.id);if(!gift)return;if(!confirm(`Купить ${gift.title} за ${gift.price} тестовых FC?`))return;await command('/api/market/buy','POST',{giftId:gift.id},r=>r.gift.emoji+' '+r.gift.title+' куплен!',true);return;}
  if(action==='favorite'){let fav=el.dataset.favorite==='1';await command(`/api/inventory/${encodeURIComponent(el.dataset.id)}/favorite`,'PATCH',{favorite:!fav},fav?'Удалено из избранного':'Добавлено в избранное');return;}
+ if(action==='mission-claim'){await command('/api/missions/claim','POST',{missionId:el.dataset.id},r=>`Награда за задание: +${r.reward} FC`);return;}
+ if(action==='achievement-claim'){await command('/api/achievements/claim','POST',{achievementId:el.dataset.id},r=>`Награда за достижение: +${r.reward} FC`);return;}
+ if(action==='wishlist'){let fav=el.dataset.favorite==='1';await command(`/api/wishlist/${encodeURIComponent(el.dataset.id)}`,'PATCH',{favorite:!fav},fav?'Удалено из списка желаний':'Добавлено в список желаний');return;}
  if(action==='promo'){let code=document.getElementById('promo')?.value||'';await command('/api/promo/redeem','POST',{code},r=>`Промокод: +${r.reward} FC`);return;}
  if(action==='toggle-favs'){ONLY_FAV=!ONLY_FAV;render();return;}
  if(action==='reset-filters'){FILTER='all';QUERY='';ONLY_FAV=false;render();return;}
@@ -1671,6 +1863,9 @@ async function actions(action,el){
 }
 ROOT.addEventListener('click',async ev=>{
  let page=ev.target.closest('[data-page]');if(page){go(page.dataset.page);return;}
+ let mf=ev.target.closest('[data-mission-filter]');if(mf){MISSION_FILTER=mf.dataset.missionFilter;render();return;}
+ let af=ev.target.closest('[data-ach-filter]');if(af){ACH_FILTER=af.dataset.achFilter;render();return;}
+ let ft=ev.target.closest('[data-fav-tab]');if(ft){FAVORITE_TAB=ft.dataset.favTab;render();return;}
  let filter=ev.target.closest('[data-filter]');if(filter){FILTER=filter.dataset.filter;render();return;}
  let mine=ev.target.closest('[data-mine]');if(mine&&MINES&&!MINES.over){let id=Number(mine.dataset.mine);if(MINES.bombs.has(id)){MINES.over=true;MINES.win=false;}
  else{MINES.open.add(id);if(MINES.open.size>=13){MINES.over=true;MINES.win=true;}}render();return;}
@@ -1834,7 +2029,7 @@ FROGI_GUIDE = r"""
                  FROGI ARENA — ONE-FILE DEPLOYMENT GUIDE
 ══════════════════════════════════════════════════════════════════════════
 
-VERSION: 2.2 Python All-in-One • Required files: exactly one, bot.py.
+VERSION: 3.0 Python All-in-One • Required files: exactly one, bot.py.
 Runtime: Python 3.10 or newer (3.11/3.12/3.13 recommended).
 External Python dependencies: ZERO.
 
@@ -2337,6 +2532,66 @@ def selftest():
                     setup_telegram()
             self.assertEqual(calls[:2], ['getMe','setWebhook'])
             self.assertIn('setChatMenuButton', calls)
+
+        def test_32_weekly_daily_streak_and_reward(self):
+            with transaction() as c:
+                u = provision(c, 32001, 'streaker', 'Streak User')
+                yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+                c.execute('INSERT INTO daily_claims(user_id,day,amount) VALUES(?,?,?)', (u['id'], yesterday, 75))
+                self.assertEqual(daily_summary(c,u['id'])['reward'], 100)
+                got=daily(c,u['id'])
+                self.assertEqual(got['reward'], 100)
+                self.assertEqual(got['daily']['streak'], 2)
+                with self.assertRaises(AppError):daily(c,u['id'])
+
+        def test_33_claim_mission_exactly_once(self):
+            with transaction() as c:
+                u=provision(c,33001,'mission33','Mission User')
+                with self.assertRaises(AppError) as no:
+                    claim_mission(c,u['id'],'spin_1')
+                self.assertEqual(no.exception.code,'NOT_COMPLETE')
+                daily(c,u['id'])
+                start=user_balance(c,u['id'])['balance']
+                response=claim_mission(c,u['id'],'daily_1')
+                self.assertEqual(response['reward'],MISSION_REWARDS['daily_1'])
+                self.assertEqual(response['user']['balance'], start+MISSION_REWARDS['daily_1'])
+                with self.assertRaises(AppError) as second:
+                    claim_mission(c,u['id'],'daily_1')
+                self.assertEqual(second.exception.code,'ALREADY_CLAIMED')
+
+        def test_34_claim_achievement_exactly_once(self):
+            with transaction() as c:
+                u=provision(c,34001,'award34','Award User')
+                self.assertEqual(claim_achievement(c,u['id'],'hello_frogi')['reward'],40)
+                with self.assertRaises(AppError) as dupe:
+                    claim_achievement(c,u['id'],'hello_frogi')
+                self.assertEqual(dupe.exception.code,'ALREADY_CLAIMED')
+                self.assertTrue(next(a for a in progress(c,u['id'])['achievements'] if a['id']=='hello_frogi')['claimed'])
+
+        def test_35_wishlist_isolated_from_users(self):
+            with transaction() as c:
+                a=provision(c,35001,'wish35a','Wish A')
+                b=provision(c,35002,'wish35b','Wish B')
+                token_a=auth_session_for_test(c,a['id'])
+                c.execute('INSERT INTO wishlist(user_id,gift_id) VALUES(?,?)',(a['id'],'gold_frog'))
+                self.assertEqual(player_state(c,a['id'])['wishlist'], ['gold_frog'])
+                self.assertEqual(player_state(c,b['id'])['wishlist'], [])
+                response=api_dispatch(c,'PATCH','/api/wishlist/gold_frog',{'favorite':False},
+                                      {'authorization':'Bearer '+token_a},{})
+                self.assertFalse(response['favorite'])
+                self.assertEqual(player_state(c,a['id'])['wishlist'], [])
+
+        def test_36_promo_history_and_new_app_pages(self):
+            with transaction() as c:
+                u=provision(c,36001,'history36','History User')
+                redeem(c,u['id'],'HELLOFROGI')
+                state=player_state(c,u['id'])
+                self.assertEqual(state['promoHistory'][0]['code'],'HELLOFROGI')
+                self.assertEqual(len(state['daily']['schedule']),7)
+            for name in ['function rewards()', 'function achievements()', 'function promos()',
+                         'function favorites()', 'function taskList(', 'class="desktop-tabs"',
+                         'class="sidebar"', 'class="daily-grid"']:
+                self.assertIn(name,HTML)
 
     def auth_session_for_test(c, uid):
         t=secrets.token_urlsafe(32)
